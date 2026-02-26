@@ -1,0 +1,9 @@
+[package]
+name = "d-dox-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iced = { version = "0.14.0", features = ["tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1.0"
