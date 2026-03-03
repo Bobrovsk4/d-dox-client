@@ -211,7 +211,7 @@ impl State {
                     container(text(error).color(Color::WHITE))
                         .padding([5, 10])
                         .style(move |_theme: &iced::Theme| container::Style {
-                            background: Some(Color::from_rgb(0.8, 0.2, 0.2).into()),
+                            background: Some(Color::from_rgb(0.8, 0.1, 0.1).into()),
                             border: iced::border::Border {
                                 radius: 5.0.into(),
                                 ..Default::default()
