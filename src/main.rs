@@ -3,13 +3,16 @@ use iced::{
     widget::{button, column, container, row, text, text_input},
 };
 use reqwest::Client;
+use serde::Deserialize;
 
 #[derive(Default)]
 pub struct State {
     auth_state: AuthState,
     is_authenticated: bool,
-    files: Vec<String>,
+    files: Vec<FileInfo>,
     files_loading: bool,
+    upload_loading: bool,
+    upload_error: Option<String>,
 }
 
 struct AuthState {
@@ -28,6 +31,20 @@ impl Default for AuthState {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileInfo {
+    pub name: String,
+    pub size: usize,
+    pub last_modified: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileWithBytes {
+    pub name: String,
+    pub size: usize,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     LoginChanged(String),
@@ -35,9 +52,16 @@ pub enum Message {
     AuthSubmit,
     AuthResult(Result<(), String>),
     FilesFetch,
-    FilesReceived(Result<Vec<String>, String>),
-    FileClicked(String),
+    FilesReceived(Result<Vec<FileInfo>, String>),
+    FileClicked(FileInfo),
+    FileDownloaded(Result<(String, Vec<u8>), String>),
+    UploadFile,
+    FileSelected(Result<Option<FileWithBytes>, String>),
+    UploadProgress(f32),
+    UploadResult(Result<String, String>),
 }
+
+const BASE_URL: &str = "http://192.168.1.71:31356";
 
 impl State {
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -74,17 +98,13 @@ impl State {
 
                 Task::perform(
                     async move {
-                        let url = "http://localhost/auth";
-                        let response = client
-                            .post(url)
-                            .json(&serde_json::json!({
-                                "login": login,
-                                "password": password,
-                            }))
+                        let url = format!("{BASE_URL}/auth");
+                        match client
+                            .post(&url)
+                            .json(&serde_json::json!({ "login": login, "password": password }))
                             .send()
-                            .await;
-
-                        match response {
+                            .await
+                        {
                             Ok(resp) if resp.status().is_success() => Ok(()),
                             Ok(resp) => Err(format!("Ошибка: {}", resp.status())),
                             Err(e) => Err(e.to_string()),
@@ -99,9 +119,7 @@ impl State {
                         self.is_authenticated = true;
                         self.auth_state.error = None;
                     }
-                    Err(e) => {
-                        self.auth_state.error = Some(e);
-                    }
+                    Err(e) => self.auth_state.error = Some(e),
                 }
                 Task::none()
             }
@@ -110,14 +128,19 @@ impl State {
                 let client = Client::new();
                 Task::perform(
                     async move {
-                        let url = "http://localhost/files";
-                        let response = client.get(url).send().await;
-                        match response {
+                        let url = format!("{BASE_URL}/files");
+                        match client.get(&url).send().await {
                             Ok(resp) if resp.status().is_success() => {
-                                let files: Vec<String> = resp.json().await.unwrap_or_default();
-                                Ok(files)
+                                println!("{:?}", resp);
+                                match resp.json::<Vec<FileInfo>>().await {
+                                    Ok(files) => {
+                                        println!("{:?}", files);
+                                        Ok(files)
+                                    },
+                                    Err(e) => Err(format!("JSON error: {e}")),
+                                }
                             }
-                            Ok(resp) => Err(format!("Ошибка: {}", resp.status())),
+                            Ok(resp) => Err(format!("HTTP {}", resp.status())),
                             Err(e) => Err(e.to_string()),
                         }
                     },
@@ -127,20 +150,148 @@ impl State {
             Message::FilesReceived(result) => {
                 self.files_loading = false;
                 match result {
-                    Ok(files) => {
-                        self.files = files;
-                    }
+                    Ok(files) => self.files = files,
                     Err(e) => {
-                        self.files = vec![];
-                        eprintln!("Ошибка загрузки файлов: {}", e);
+                        self.files.clear();
+                        eprintln!("Ошибка загрузки файлов: {e}");
                     }
                 }
                 Task::none()
             }
-            Message::FileClicked(filename) => {
-                eprintln!("{}", filename);
+            Message::FileClicked(file_info) => {
+                let client = Client::new();
+                let url = format!("{BASE_URL}/files/{}", file_info.name);
+                let file_name = file_info.name.clone();
+
+                Task::perform(
+                    async move {
+                        match client.get(&url).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                match resp.bytes().await {
+                                    Ok(bytes) => Ok((file_name, bytes.to_vec())),
+                                    Err(e) => Err(format!("Read error: {e}")),
+                                }
+                            }
+                            Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    },
+                    Message::FileDownloaded,
+                )
+            }
+            Message::FileDownloaded(result) => {
+                match result {
+                    Ok((file_name, bytes)) => {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_file_name(&file_name)
+                            .save_file()
+                        {
+                            let _ = std::fs::write(path, bytes);
+                        }
+                    }
+                    Err(e) => eprintln!("Download failed: {e}"),
+                }
                 Task::none()
             }
+            Message::UploadFile => {
+                Task::perform(
+                    async move {
+                        let picked: Result<Option<std::path::PathBuf>, String> = tokio::task::spawn_blocking(|| {
+                            rfd::FileDialog::new()
+                                .set_title("Выберите файл для загрузки")
+                                .pick_file()
+                        })
+                        .await
+                        .map_err(|e| format!("Dialog error: {e}"));
+
+                        let Ok(picked) = picked else {
+                            return Err(picked.unwrap_err());
+                        };
+
+                        let Some(path) = picked else {
+                            return Ok(None);
+                        };
+
+                        let file_name = path
+                            .file_name()
+                            .and_then(|n: &std::ffi::OsStr| n.to_str())
+                            .ok_or("Invalid filename")?
+                            .to_string();
+
+                        let bytes: Result<Vec<u8>, String> = tokio::fs::read(&path)
+                            .await
+                            .map_err(|e| format!("Read error: {e}"));
+
+                        let bytes = bytes?;
+
+                        Ok(Some(FileWithBytes {
+                            name: file_name,
+                            size: bytes.len(),
+                            bytes,
+                        }))
+                    },
+                    Message::FileSelected,
+                )
+            }
+
+            Message::FileSelected(result) => {
+                match result {
+                    Ok(Some(file_data)) => {
+                        let client = Client::new();
+                        let file_name = file_data.name.clone();
+                        let bytes = file_data.bytes;
+
+                        Task::perform(
+                            async move {
+                                let part = reqwest::multipart::Part::bytes(bytes)
+                                    .file_name(file_name.clone());
+
+                                let form = reqwest::multipart::Form::new()
+                                    .part("file", part);
+
+                                let url = format!("{BASE_URL}/files");
+                                let resp: reqwest::Response = client.post(&url).multipart(form).send().await
+                                    .map_err(|e| e.to_string())?;
+
+                                if resp.status().is_success() {
+                                    match resp.json::<serde_json::Value>().await {
+                                        Ok(v) => Ok(v["uploaded"].as_array()
+                                            .and_then(|arr: &Vec<serde_json::Value>| arr.first())
+                                            .and_then(|v: &serde_json::Value| v.as_str())
+                                            .unwrap_or(&file_name)
+                                            .to_string()),
+                                        Err(_) => Ok(file_name),
+                                    }
+                                } else {
+                                    Err(format!("HTTP {}", resp.status()))
+                                }
+                            },
+                            Message::UploadResult,
+                        )
+                    }
+                    Ok(None) => Task::none(),
+                    Err(e) => {
+                        self.upload_error = Some(format!("Ошибка загрузки: {e}"));
+                        Task::none()
+                    }
+                }
+            }
+
+            Message::UploadResult(result) => {
+                match result {
+                    Ok(_uploaded_name) => {
+                        self.upload_loading = false;
+                        self.upload_error = None;
+                        return Task::perform(async { Message::FilesFetch }, |m| m);
+                    }
+                    Err(e) => {
+                        self.upload_loading = false;
+                        self.upload_error = Some(format!("Ошибка загрузки: {e}"));
+                    }
+                }
+                Task::none()
+            }
+            Message::UploadProgress(_) => Task::none(),
         }
     }
 
@@ -162,13 +313,17 @@ impl State {
             .map(|chunk| {
                 let file_buttons: Vec<Element<'_, Message>> = chunk
                     .iter()
-                    .map(|filename| {
+                    .map(|file_info| {
                         button(
-                            column![text("-").size(48), text(filename).size(11),]
-                                .spacing(8)
-                                .align_x(Alignment::Center),
+                            column![
+                                text("🗎").size(44),
+                                text(&file_info.name).size(9).width(Length::Fixed(file_size)),
+                                text(format!("{} KB", file_info.size / 1024)).size(9),
+                            ]
+                            .spacing(4)
+                            .align_x(Alignment::Center),
                         )
-                        .on_press(Message::FileClicked(filename.clone()))
+                        .on_press(Message::FileClicked(file_info.clone()))
                         .width(Length::Fixed(file_size))
                         .height(Length::Fixed(file_size))
                         .padding(10)
@@ -180,24 +335,47 @@ impl State {
                 while row_widgets.len() < columns {
                     row_widgets.push(container("").width(Length::Fixed(file_size)).into());
                 }
-
                 row(row_widgets).spacing(10).into()
             })
             .collect();
 
+        let upload_button = button(
+            row![text("Загрузить").size(14)]
+                .spacing(8)
+                .align_y(Alignment::Center),
+        )
+        .on_press(Message::UploadFile)
+        .padding([8, 16])
+        .style(move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
+            background: Some(Color::from_rgb(0.2, 0.6, 0.3).into()),
+            ..Default::default()
+        });
+
+        let header_row = row![refresh_button, upload_button].spacing(10);
+
         let content = if self.files_loading {
-            column![text("Загрузка...").size(16),]
-                .spacing(10)
-                .align_x(Alignment::Center)
+            column![text("Загрузка списка...").size(16)].align_x(Alignment::Center)
+        } else if self.upload_loading {
+            column![
+                text("Загрузка файла...").size(16),
+            ].align_x(Alignment::Center)
         } else {
-            column![refresh_button, column(files_rows).spacing(10).padding(10),].spacing(10)
+            let mut content_col: Vec<Element<'_, Message>> = vec![header_row.into()];
+            
+            if let Some(e) = &self.upload_error {
+                content_col.push(
+                    container(text(e).color(Color::from_rgb(1.0, 0.3, 0.3)))
+                        .padding(5)
+                        .into()
+                );
+            }
+            
+            content_col.push(column(files_rows).spacing(10).padding(10).into());
+            
+            column(content_col).spacing(10)
         };
 
-        container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(20)
-            .into()
+        container(content).width(Length::Fill).height(Length::Fill).padding(20).into()
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -205,23 +383,15 @@ impl State {
             return self.create_main_window();
         }
 
-        let error_message: Option<container::Container<'_, Message>> =
-            if let Some(error) = &self.auth_state.error {
-                Some(
-                    container(text(error).color(Color::WHITE))
-                        .padding([5, 10])
-                        .style(move |_theme: &iced::Theme| container::Style {
-                            background: Some(Color::from_rgb(0.8, 0.2, 0.2).into()),
-                            border: iced::border::Border {
-                                radius: 5.0.into(),
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        }),
-                )
-            } else {
-                None
-            };
+        let error_message = self.auth_state.error.as_ref().map(|error| {
+            container(text(error).color(Color::WHITE))
+                .padding([5, 10])
+                .style(|_| container::Style {
+                    background: Some(Color::from_rgb(0.8, 0.2, 0.2).into()),
+                    border: iced::border::Border { radius: 5.0.into(), ..Default::default() },
+                    ..Default::default()
+                })
+        });
 
         let auth_form = column![
             text("Авторизация").size(24),
@@ -230,7 +400,7 @@ impl State {
                 .on_input(Message::PasswordChanged)
                 .secure(true),
             button("Войти").on_press(Message::AuthSubmit),
-            error_message
+            error_message,
         ]
         .spacing(10)
         .align_x(Alignment::Center);
@@ -239,12 +409,9 @@ impl State {
             container(auth_form)
                 .padding(20)
                 .width(Length::Fixed(300.0))
-                .style(move |_theme: &iced::Theme| container::Style {
+                .style(|_| container::Style {
                     background: Some(Color::from_rgb(0.15, 0.15, 0.15).into()),
-                    border: iced::border::Border {
-                        radius: 10.0.into(),
-                        ..Default::default()
-                    },
+                    border: iced::border::Border { radius: 10.0.into(), ..Default::default() },
                     ..Default::default()
                 }),
         )
