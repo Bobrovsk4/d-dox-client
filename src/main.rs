@@ -1,9 +1,10 @@
 use iced::{
     Alignment, Color, Element, Length, Task,
-    widget::{button, column, container, row, text, text_input},
+    widget::{button, column, container, row, text, text_input, tooltip},
 };
 use reqwest::Client;
 use serde::Deserialize;
+use std::path::PathBuf;
 
 #[derive(Default)]
 pub struct State {
@@ -13,6 +14,8 @@ pub struct State {
     files_loading: bool,
     upload_loading: bool,
     upload_error: Option<String>,
+    download_folder: Option<PathBuf>,
+    files_to_download: Vec<FileInfo>,
 }
 
 struct AuthState {
@@ -59,6 +62,9 @@ pub enum Message {
     FileSelected(Result<Option<FileWithBytes>, String>),
     UploadProgress(f32),
     UploadResult(Result<String, String>),
+    DownloadNextFile,
+    FileDownloadedToLocal(Result<(String, Vec<u8>, PathBuf), String>),
+    FileDownloadedToFolder(Result<(String, Vec<u8>, PathBuf), String>),
 }
 
 const BASE_URL: &str = "http://192.168.1.71:31356";
@@ -150,7 +156,17 @@ impl State {
             Message::FilesReceived(result) => {
                 self.files_loading = false;
                 match result {
-                    Ok(files) => self.files = files,
+                    Ok(files) => {
+                        self.files = files.clone();
+                        if self.download_folder.is_none() {
+                            self.download_folder = Some(std::env::current_dir().unwrap().join("downloads"));
+                        }
+                        if let Some(ref folder) = self.download_folder {
+                            let _ = std::fs::create_dir_all(folder);
+                        }
+                        self.files_to_download = files;
+                        return Task::perform(async { Message::DownloadNextFile }, |m| m);
+                    }
                     Err(e) => {
                         self.files.clear();
                         eprintln!("Ошибка загрузки файлов: {e}");
@@ -159,25 +175,31 @@ impl State {
                 Task::none()
             }
             Message::FileClicked(file_info) => {
-                let client = Client::new();
-                let url = format!("{BASE_URL}/files/{}", file_info.name);
-                let file_name = file_info.name.clone();
+                if let Some(ref folder) = self.download_folder {
+                    let file_path = folder.join(&file_info.name);
+                    if file_path.exists() {
+                        let _ = open::that(file_path);
+                    } else {
+                        let client = Client::new();
+                        let url = format!("{BASE_URL}/files/{}", file_info.name);
+                        let file_name = file_info.name.clone();
+                        let folder = folder.clone();
 
-                Task::perform(
-                    async move {
-                        match client.get(&url).send().await {
-                            Ok(resp) if resp.status().is_success() => {
-                                match resp.bytes().await {
-                                    Ok(bytes) => Ok((file_name, bytes.to_vec())),
-                                    Err(e) => Err(format!("Read error: {e}")),
+                        return Task::perform(async move {
+                            match client.get(&url).send().await {
+                                Ok(resp) if resp.status().is_success() => {
+                                    match resp.bytes().await {
+                                        Ok(bytes) => Ok((file_name, bytes.to_vec(), folder)),
+                                        Err(e) => Err(format!("Read error: {e}")),
+                                    }
                                 }
+                                Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                                Err(e) => Err(e.to_string()),
                             }
-                            Ok(resp) => Err(format!("HTTP {}", resp.status())),
-                            Err(e) => Err(e.to_string()),
-                        }
-                    },
-                    Message::FileDownloaded,
-                )
+                        }, Message::FileDownloadedToFolder);
+                    }
+                }
+                Task::none()
             }
             Message::FileDownloaded(result) => {
                 match result {
@@ -188,6 +210,17 @@ impl State {
                         {
                             let _ = std::fs::write(path, bytes);
                         }
+                    }
+                    Err(e) => eprintln!("Download failed: {e}"),
+                }
+                Task::none()
+            }
+            Message::FileDownloadedToFolder(result) => {
+                match result {
+                    Ok((file_name, bytes, folder)) => {
+                        let file_path = folder.join(&file_name);
+                        let _ = std::fs::write(&file_path, bytes);
+                        let _ = open::that(&file_path);
                     }
                     Err(e) => eprintln!("Download failed: {e}"),
                 }
@@ -292,6 +325,45 @@ impl State {
                 Task::none()
             }
             Message::UploadProgress(_) => Task::none(),
+            Message::DownloadNextFile => {
+                if let Some(file_info) = self.files_to_download.first() {
+                    let client = Client::new();
+                    let url = format!("{BASE_URL}/files/{}", file_info.name);
+                    let file_name = file_info.name.clone();
+                    let folder = self.download_folder.clone().unwrap();
+
+                    return Task::perform(async move {
+                        match client.get(&url).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                match resp.bytes().await {
+                                    Ok(bytes) => Ok((file_name, bytes.to_vec(), folder)),
+                                    Err(e) => Err(format!("Read error: {e}")),
+                                }
+                            }
+                            Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }, Message::FileDownloadedToLocal);
+                }
+                Task::none()
+            }
+            Message::FileDownloadedToLocal(result) => {
+                match result {
+                    Ok((file_name, bytes, folder)) => {
+                        let file_path = folder.join(&file_name);
+                        if !file_path.exists() {
+                            let _ = std::fs::write(&file_path, bytes);
+                        }
+                        self.files_to_download.remove(0);
+                        return Task::perform(async { Message::DownloadNextFile }, |m| m);
+                    }
+                    Err(e) => {
+                        eprintln!("Download failed: {e}");
+                        self.files_to_download.remove(0);
+                        return Task::perform(async { Message::DownloadNextFile }, |m| m);
+                    }
+                }
+            }
         }
     }
 
@@ -314,20 +386,31 @@ impl State {
                 let file_buttons: Vec<Element<'_, Message>> = chunk
                     .iter()
                     .map(|file_info| {
-                        button(
-                            column![
-                                text("🗎").size(44),
-                                text(&file_info.name).size(9).width(Length::Fixed(file_size)),
-                                text(format!("{} KB", file_info.size / 1024)).size(9),
-                            ]
-                            .spacing(4)
-                            .align_x(Alignment::Center),
-                        )
-                        .on_press(Message::FileClicked(file_info.clone()))
-                        .width(Length::Fixed(file_size))
-                        .height(Length::Fixed(file_size))
-                        .padding(10)
-                        .into()
+                        let content = column![
+                            text("🗎").size(44),
+                            container(
+                                text(&file_info.name)
+                                    .size(11)
+                                    .shaping(text::Shaping::Advanced)
+                            )
+                            .width(Length::Fixed(file_size))
+                            .height(Length::Fixed(40.0))
+                            .align_x(iced::alignment::Horizontal::Center)
+                            .center_y(Length::Fixed(40.0))
+                            .clip(true),
+                            text(format!("{} KB", file_info.size / 1024)).size(9),
+                        ]
+                        .spacing(4)
+                        .align_x(Alignment::Center);
+
+                        let btn = button(content)
+                            .on_press(Message::FileClicked(file_info.clone()))
+                            .width(Length::Fixed(file_size))
+                            .height(Length::Fixed(file_size))
+                            .padding(10);
+
+                        tooltip(btn, text(&file_info.name).size(14), tooltip::Position::FollowCursor)
+                            .into()
                     })
                     .collect();
 
