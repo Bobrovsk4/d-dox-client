@@ -5,6 +5,7 @@ use iced::{
 use reqwest::Client;
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::collections::HashSet;
 
 #[derive(Default)]
 pub struct State {
@@ -16,6 +17,7 @@ pub struct State {
     upload_error: Option<String>,
     download_folder: Option<PathBuf>,
     files_to_download: Vec<FileInfo>,
+    modified_files: HashSet<String>,
 }
 
 struct AuthState {
@@ -65,6 +67,9 @@ pub enum Message {
     DownloadNextFile,
     FileDownloadedToLocal(Result<(String, Vec<u8>, PathBuf), String>),
     FileDownloadedToFolder(Result<(String, Vec<u8>, PathBuf), String>),
+    FileModified(String),
+    SyncFile(String),
+    FileSynced(Result<String, String>),
 }
 
 const BASE_URL: &str = "http://192.168.1.71:31356";
@@ -157,6 +162,7 @@ impl State {
                 self.files_loading = false;
                 match result {
                     Ok(files) => {
+                        let old_files: HashSet<String> = self.files.iter().map(|f| f.name.clone()).collect();
                         self.files = files.clone();
                         if self.download_folder.is_none() {
                             self.download_folder = Some(std::env::current_dir().unwrap().join("downloads"));
@@ -165,7 +171,11 @@ impl State {
                             let _ = std::fs::create_dir_all(folder);
                         }
                         self.files_to_download = files;
-                        return Task::perform(async { Message::DownloadNextFile }, |m| m);
+                        if !self.files_to_download.is_empty() {
+                            return Task::perform(async { Message::DownloadNextFile }, |m| m);
+                        } else if !old_files.is_empty() {
+                            return self.check_and_sync_files();
+                        }
                     }
                     Err(e) => {
                         self.files.clear();
@@ -355,16 +365,86 @@ impl State {
                             let _ = std::fs::write(&file_path, bytes);
                         }
                         self.files_to_download.remove(0);
+                        if self.files_to_download.is_empty() {
+                            return self.check_and_sync_files();
+                        }
                         return Task::perform(async { Message::DownloadNextFile }, |m| m);
                     }
                     Err(e) => {
                         eprintln!("Download failed: {e}");
                         self.files_to_download.remove(0);
+                        if self.files_to_download.is_empty() {
+                            return self.check_and_sync_files();
+                        }
                         return Task::perform(async { Message::DownloadNextFile }, |m| m);
                     }
                 }
             }
+            Message::FileModified(file_name) => {
+                self.modified_files.insert(file_name.clone());
+                return Task::perform(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    Message::SyncFile(file_name)
+                }, |m| m);
+            }
+            Message::SyncFile(file_name) => {
+                if let Some(ref folder) = self.download_folder {
+                    let file_path = folder.join(&file_name);
+                    if file_path.exists() && self.modified_files.contains(&file_name) {
+                        self.modified_files.remove(&file_name);
+                        let client = Client::new();
+                        let file_name_clone = file_name.clone();
+                        
+                        return Task::perform(async move {
+                            let bytes = match tokio::fs::read(&file_path).await {
+                                Ok(b) => b,
+                                Err(e) => return Err(format!("Read error: {e}")),
+                            };
+                            
+                            let part = reqwest::multipart::Part::bytes(bytes.to_vec())
+                                .file_name(file_name_clone.clone());
+                            let form = reqwest::multipart::Form::new()
+                                .part("file", part);
+                            let url = format!("{BASE_URL}/files");
+                            
+                            match client.post(&url).multipart(form).send().await {
+                                Ok(resp) if resp.status().is_success() => Ok(file_name_clone),
+                                Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                                Err(e) => Err(e.to_string()),
+                            }
+                        }, Message::FileSynced);
+                    }
+                }
+                Task::none()
+            }
+            Message::FileSynced(result) => {
+                match result {
+                    Ok(name) => println!("File synced: {}", name),
+                    Err(e) => eprintln!("Sync failed: {e}"),
+                }
+                Task::none()
+            }
         }
+    }
+
+    fn check_and_sync_files(&mut self) -> Task<Message> {
+        if let Some(ref folder) = self.download_folder {
+            if let Ok(entries) = std::fs::read_dir(folder) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) {
+                        if self.files.iter().any(|f| f.name == name) {
+                            self.modified_files.insert(name);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(file_name) = self.modified_files.iter().next().cloned() {
+            return Task::perform(async move {
+                Message::SyncFile(file_name)
+            }, |m| m);
+        }
+        Task::none()
     }
 
     fn create_main_window(&self) -> Element<'_, Message> {
