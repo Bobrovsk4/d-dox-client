@@ -1,11 +1,48 @@
 use iced::{
     Alignment, Color, Element, Length, Task,
-    widget::{button, column, container, row, text, text_input, tooltip},
+    widget::{button, column, container, row, text, text_input, tooltip, scrollable},
 };
 use reqwest::Client;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::collections::HashSet;
+
+#[derive(Debug, Clone)]
+pub enum LogType {
+    Info,
+    Success,
+    Warning,
+    Error,
+    Debug,
+    GitBranch,
+    GitCommit,
+    GitAdded,
+    GitModified,
+    GitDeleted,
+}
+
+impl LogType {
+    fn color(&self) -> Color {
+        match self {
+            LogType::Info => Color::WHITE,
+            LogType::Success => Color::from_rgb(0.2, 0.8, 0.2),
+            LogType::Warning => Color::from_rgb(1.0, 0.8, 0.0),
+            LogType::Error => Color::from_rgb(1.0, 0.3, 0.3),
+            LogType::Debug => Color::from_rgb(0.5, 0.5, 0.5),
+            LogType::GitBranch => Color::from_rgb(0.0, 0.8, 0.8),
+            LogType::GitCommit => Color::WHITE,
+            LogType::GitAdded => Color::from_rgb(0.2, 0.8, 0.2),
+            LogType::GitModified => Color::from_rgb(1.0, 0.8, 0.0),
+            LogType::GitDeleted => Color::from_rgb(1.0, 0.3, 0.3),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    pub message: String,
+    pub log_type: LogType,
+}
 
 #[derive(Default)]
 pub struct State {
@@ -18,6 +55,16 @@ pub struct State {
     download_folder: Option<PathBuf>,
     files_to_download: Vec<FileInfo>,
     modified_files: HashSet<String>,
+    active_tab: u32,
+    terminal_logs: Vec<LogEntry>,
+}
+
+impl State {
+    fn init_logs(&mut self) {
+        self.add_log("=== D-Dox Client Started ===".to_string(), LogType::GitBranch);
+        self.add_log("Initializing...".to_string(), LogType::Info);
+        self.add_log("Ready for authentication".to_string(), LogType::Success);
+    }
 }
 
 struct AuthState {
@@ -70,6 +117,8 @@ pub enum Message {
     FileModified(String),
     SyncFile(String),
     FileSynced(Result<String, String>),
+    TabChanged(u32),
+    ClearTerminal,
 }
 
 const BASE_URL: &str = "http://192.168.1.71:31356";
@@ -129,6 +178,7 @@ impl State {
                     Ok(()) => {
                         self.is_authenticated = true;
                         self.auth_state.error = None;
+                        self.init_logs();
                     }
                     Err(e) => self.auth_state.error = Some(e),
                 }
@@ -163,6 +213,7 @@ impl State {
                 match result {
                     Ok(files) => {
                         let old_files: HashSet<String> = self.files.iter().map(|f| f.name.clone()).collect();
+                        self.add_log(format!("Files fetched: {} files", files.len()), LogType::GitBranch);
                         self.files = files.clone();
                         if self.download_folder.is_none() {
                             self.download_folder = Some(std::env::current_dir().unwrap().join("downloads"));
@@ -231,8 +282,12 @@ impl State {
                         let file_path = folder.join(&file_name);
                         let _ = std::fs::write(&file_path, bytes);
                         let _ = open::that(&file_path);
+                        self.add_log(format!("Downloaded: {}", file_name), LogType::GitAdded);
                     }
-                    Err(e) => eprintln!("Download failed: {e}"),
+                    Err(e) => {
+                        eprintln!("Download failed: {e}");
+                        self.add_log(format!("Download failed: {}", e), LogType::Error);
+                    }
                 }
                 Task::none()
             }
@@ -325,11 +380,13 @@ impl State {
                     Ok(_uploaded_name) => {
                         self.upload_loading = false;
                         self.upload_error = None;
+                        self.add_log("File uploaded successfully".to_string(), LogType::Success);
                         return Task::perform(async { Message::FilesFetch }, |m| m);
                     }
                     Err(e) => {
                         self.upload_loading = false;
                         self.upload_error = Some(format!("Ошибка загрузки: {e}"));
+                        self.add_log(format!("Upload failed: {}", e), LogType::Error);
                     }
                 }
                 Task::none()
@@ -419,9 +476,23 @@ impl State {
             }
             Message::FileSynced(result) => {
                 match result {
-                    Ok(name) => println!("File synced: {}", name),
-                    Err(e) => eprintln!("Sync failed: {e}"),
+                    Ok(name) => {
+                        println!("File synced: {}", name);
+                        self.add_log(format!("Synced: {}", name), LogType::GitModified);
+                    }
+                    Err(e) => {
+                        eprintln!("Sync failed: {e}");
+                        self.add_log(format!("Sync failed: {}", e), LogType::Error);
+                    }
                 }
+                Task::none()
+            }
+            Message::TabChanged(tab_index) => {
+                self.active_tab = tab_index;
+                Task::none()
+            }
+            Message::ClearTerminal => {
+                self.terminal_logs.clear();
                 Task::none()
             }
         }
@@ -445,6 +516,68 @@ impl State {
             }, |m| m);
         }
         Task::none()
+    }
+
+    fn add_log(&mut self, message: String, log_type: LogType) {
+        self.terminal_logs.push(LogEntry { message, log_type });
+        if self.terminal_logs.len() > 1000 {
+            self.terminal_logs.remove(0);
+        }
+    }
+
+    fn create_terminal_tab(&self) -> Element<'_, Message> {
+        let logs: Vec<Element<'_, Message>> = self
+            .terminal_logs
+            .iter()
+            .map(|entry| {
+                text(&entry.message)
+                    .size(12)
+                    .color(entry.log_type.color())
+                    .into()
+            })
+            .collect();
+
+        let clear_button = button(
+            row![text("Очистить").size(12)]
+                .spacing(8)
+                .align_y(Alignment::Center),
+        )
+        .on_press(Message::ClearTerminal)
+        .padding([6, 12])
+        .style(move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
+            background: Some(Color::from_rgb(0.6, 0.2, 0.2).into()),
+            ..Default::default()
+        });
+
+        let header = row![clear_button].spacing(10);
+
+        let terminal_content = if logs.is_empty() {
+            column![text("Нет логов").color(Color::from_rgb(0.5, 0.5, 0.5)).size(14)]
+                .align_x(Alignment::Center)
+                .padding(20)
+        } else {
+            column(logs)
+        };
+
+        let scrollable_terminal = container(
+            scrollable(terminal_content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+        )
+        .padding(10)
+        .style(move |_| container::Style {
+            background: Some(Color::from_rgb(0.08, 0.08, 0.08).into()),
+            border: iced::border::Border {
+                radius: 5.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        column![header, scrollable_terminal]
+            .spacing(10)
+            .height(Length::Fill)
+            .into()
     }
 
     fn create_main_window(&self) -> Element<'_, Message> {
@@ -543,7 +676,58 @@ impl State {
 
     fn view(&self) -> Element<'_, Message> {
         if self.is_authenticated {
-            return self.create_main_window();
+            let main_content = self.create_main_window();
+            let terminal_content = self.create_terminal_tab();
+            
+            let tab_button_style = |active: bool| -> container::Style {
+                if active {
+                    container::Style {
+                        background: Some(Color::from_rgb(0.2, 0.6, 0.3).into()),
+                        text_color: Some(Color::WHITE),
+                        border: iced::border::Border {
+                            radius: 10.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                } else {
+                    container::Style {
+                        background: Some(Color::from_rgb(0.15, 0.15, 0.15).into()),
+                        text_color: Some(Color::WHITE),
+                        border: iced::border::Border {
+                            radius: 10.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                }
+            };
+
+            let tab1 = button(
+                container(text("Главная").size(14))
+                    .padding([10, 20])
+                    .style(move |_| tab_button_style(self.active_tab == 0))
+            )
+            .on_press(Message::TabChanged(0));
+
+            let tab2 = button(
+                container(text("Терминал").size(14))
+                    .padding([10, 20])
+                    .style(move |_| tab_button_style(self.active_tab == 1))
+            )
+            .on_press(Message::TabChanged(1));
+
+            let tab_bar = row![tab1, tab2]
+                .spacing(5);
+
+            let content = match self.active_tab {
+                0 => main_content,
+                _ => terminal_content,
+            };
+
+            return column![tab_bar, content]
+                .spacing(0)
+                .into();
         }
 
         let error_message = self.auth_state.error.as_ref().map(|error| {
