@@ -3,7 +3,8 @@ use iced::{
     widget::{button, column, container, row, text, text_input, tooltip, scrollable},
 };
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use jsonwebtoken::{decode, DecodingKey, Validation};
 use std::path::PathBuf;
 use std::collections::HashSet;
 use std::collections::HashMap;
@@ -63,6 +64,8 @@ pub struct TrackedFile {
 pub struct State {
     auth_state: AuthState,
     is_authenticated: bool,
+    jwt_token: Option<String>,
+    current_user: Option<UserInfo>,
     files: Vec<FileInfo>,
     files_loading: bool,
     upload_loading: bool,
@@ -70,17 +73,9 @@ pub struct State {
     download_folder: Option<PathBuf>,
     files_to_download: Vec<FileInfo>,
     modified_files: HashSet<String>,
-    active_tab: u32,
+    active_tab: u32,//
     terminal_logs: Vec<LogEntry>,
     tracked_files: HashMap<String, TrackedFile>,
-}
-
-impl State {
-    fn init_logs(&mut self) {
-        self.add_log("=== D-Dox Client Started ===".to_string(), LogType::GitBranch);
-        self.add_log("Initializing...".to_string(), LogType::Info);
-        self.add_log("Ready for authentication".to_string(), LogType::Success);
-    }
 }
 
 struct AuthState {
@@ -106,11 +101,39 @@ pub struct FileInfo {
     pub last_modified: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Claims {
+    pub pid: String,
+    pub login: String,
+    pub exp: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleInfo {
+    pub id: i32,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserInfo {
+    pub id: i32,
+    pub username: String,
+    pub login: String,
+    pub role: Option<RoleInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthResponse {
+    pub token: String,
+    pub user: UserInfo,
+}
+
 #[derive(Debug, Clone)]
 pub struct FileWithBytes {
     pub name: String,
     pub size: usize,
     pub bytes: Vec<u8>,
+    pub auth_header: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,29 +141,32 @@ pub enum Message {
     LoginChanged(String),
     PasswordChanged(String),
     AuthSubmit,
-    AuthResult(Result<(), String>),
+    AuthResult(Result<AuthResponse, String>),
     FilesFetch,
     FilesReceived(Result<Vec<FileInfo>, String>),
     FileClicked(FileInfo),
-    FileDownloaded(Result<(String, Vec<u8>), String>),
     UploadFile,
     FileSelected(Result<Option<FileWithBytes>, String>),
-    UploadProgress(f32),
     UploadResult(Result<String, String>),
     DownloadNextFile,
     FileDownloadedToLocal(Result<(String, Vec<u8>, PathBuf), String>),
     FileDownloadedToFolder(Result<(String, Vec<u8>, PathBuf), String>),
-    FileModified(String),
     SyncFile(String),
     FileSynced(Result<String, String>),
     TabChanged(u32),
     ClearTerminal,
     FileChangesChecked,
+    SyncAllFiles,
+    Logout,
 }
 
 const BASE_URL: &str = "http://192.168.1.71:31356";
 
 impl State {
+    fn get_auth_header(&self) -> Option<String> {
+        self.jwt_token.as_ref().map(|token| format!("Bearer {token}"))
+    }
+    
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::LoginChanged(login) => {
@@ -154,6 +180,7 @@ impl State {
                 Task::none()
             }
             Message::AuthSubmit => {
+                println!("AuthSubmit");
                 if self.auth_state.login.is_empty() {
                     self.auth_state.error = Some("Введите логин".to_string());
                     return Task::none();
@@ -163,62 +190,103 @@ impl State {
                     return Task::none();
                 }
 
-                if self.auth_state.login == "123" && self.auth_state.password == "123" {
-                    self.is_authenticated = true;
-                    self.auth_state.error = None;
-                    return Task::none();
-                }
-
                 let client = Client::new();
                 let login = self.auth_state.login.clone();
                 let password = self.auth_state.password.clone();
 
                 Task::perform(
                     async move {
-                        let url = format!("{BASE_URL}/auth");
+                        let url = format!("{BASE_URL}/auth/login");
                         match client
                             .post(&url)
                             .json(&serde_json::json!({ "login": login, "password": password }))
                             .send()
                             .await
                         {
-                            Ok(resp) if resp.status().is_success() => Ok(()),
-                            Ok(resp) => Err(format!("Ошибка: {}", resp.status())),
-                            Err(e) => Err(e.to_string()),
+                            Ok(resp) if resp.status().is_success() => {
+                                match resp.json::<AuthResponse>().await {
+                                    Ok(auth_resp) => Ok(auth_resp),
+                                    Err(e) => Err(format!("JSON error: {e}")),
+                                }
+                            }
+                            Ok(resp) => {
+                                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                                    Err("Сервер не найден. Проверьте адрес.".to_string())
+                                } else {
+                                    Err(format!("Ошибка: {}", resp.status()))
+                                }
+                            }
+                            Err(e) => Err(format!("Ошибка соединения: {e}")),
                         }
                     },
                     Message::AuthResult,
                 )
             }
             Message::AuthResult(result) => {
+                println!("AuthResult");
                 match result {
-                    Ok(()) => {
-                        self.is_authenticated = true;
-                        self.auth_state.error = None;
-                        self.init_logs();
+                    Ok(auth_resp) => {
+                        let secret = "v7SWenu8m9aPQuDkL6pw";
+                        match decode::<Claims>(
+                            &auth_resp.token,
+                            &DecodingKey::from_secret(secret.as_bytes()),
+                            &Validation::default(),
+                        ) {
+                            Ok(_) => {
+                                self.jwt_token = Some(auth_resp.token);
+                                self.current_user = Some(auth_resp.user);
+                                self.is_authenticated = true;
+                                self.auth_state.error = None;
+                                return Task::perform(async { Message::FilesFetch }, |m| m);
+                            }
+                            Err(e) => {
+                                self.auth_state.error = Some(format!("Invalid token: {e}"));
+                            }
+                        }
                     }
-                    Err(e) => self.auth_state.error = Some(e),
+                    Err(e) => {
+                        if e == "Logged out" {
+                            self.jwt_token = None;
+                            self.current_user = None;
+                            self.is_authenticated = false;
+                            self.auth_state.login.clear();
+                            self.auth_state.password.clear();
+                            self.auth_state.error = None;
+                            self.files.clear();
+                            self.add_log("User logged out".to_string(), LogType::Info);
+                        } else {
+                            self.auth_state.error = Some(e);
+                        }
+                    }
                 }
                 Task::none()
             }
             Message::FilesFetch => {
+                println!("FilesFetch");
                 self.files_loading = true;
                 let client = Client::new();
+                let auth_header = self.get_auth_header();
+                println!("Auth header: {:?}", auth_header);
                 Task::perform(
                     async move {
                         let url = format!("{BASE_URL}/files");
-                        match client.get(&url).send().await {
+                        let mut req = client.get(&url);
+                        if let Some(token) = auth_header {
+                            req = req.header("Authorization", token);
+                        }
+                        match req.send().await {
                             Ok(resp) if resp.status().is_success() => {
-                                println!("{:?}", resp);
                                 match resp.json::<Vec<FileInfo>>().await {
-                                    Ok(files) => {
-                                        println!("{:?}", files);
-                                        Ok(files)
-                                    },
+                                    Ok(files) => Ok(files),
                                     Err(e) => Err(format!("JSON error: {e}")),
                                 }
                             }
-                            Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                            Ok(resp) => {
+                                let status = resp.status();
+                                let body = resp.text().await.unwrap_or_default();
+                                println!("Server error response: {}", body);
+                                Err(format!("HTTP {}", status))
+                            },
                             Err(e) => Err(e.to_string()),
                         }
                     },
@@ -226,10 +294,10 @@ impl State {
                 )
             }
             Message::FilesReceived(result) => {
+                println!("FilesReceived");
                 self.files_loading = false;
                 match result {
                     Ok(files) => {
-                        let old_files: HashSet<String> = self.files.iter().map(|f| f.name.clone()).collect();
                         self.add_log(format!("Files fetched: {} files", files.len()), LogType::GitBranch);
                         self.files = files.clone();
                         if self.download_folder.is_none() {
@@ -241,8 +309,6 @@ impl State {
                         self.files_to_download = files;
                         if !self.files_to_download.is_empty() {
                             return Task::perform(async { Message::DownloadNextFile }, |m| m);
-                        } else if !old_files.is_empty() {
-                            return self.check_and_sync_files();
                         }
                     }
                     Err(e) => {
@@ -253,6 +319,7 @@ impl State {
                 Task::none()
             }
             Message::FileClicked(file_info) => {
+                println!("FileClicked");
                 if let Some(ref folder) = self.download_folder {
                     let file_path = folder.join(&file_info.name);
                     if file_path.exists() {
@@ -262,9 +329,14 @@ impl State {
                         let url = format!("{BASE_URL}/files/{}", file_info.name);
                         let file_name = file_info.name.clone();
                         let folder = folder.clone();
+                        let auth_header = self.get_auth_header();
 
                         return Task::perform(async move {
-                            match client.get(&url).send().await {
+                            let mut req = client.get(&url);
+                            if let Some(token) = auth_header {
+                                req = req.header("Authorization", token);
+                            }
+                            match req.send().await {
                                 Ok(resp) if resp.status().is_success() => {
                                     match resp.bytes().await {
                                         Ok(bytes) => Ok((file_name, bytes.to_vec(), folder)),
@@ -279,21 +351,8 @@ impl State {
                 }
                 Task::none()
             }
-            Message::FileDownloaded(result) => {
-                match result {
-                    Ok((file_name, bytes)) => {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .set_file_name(&file_name)
-                            .save_file()
-                        {
-                            let _ = std::fs::write(path, bytes);
-                        }
-                    }
-                    Err(e) => eprintln!("Download failed: {e}"),
-                }
-                Task::none()
-            }
             Message::FileDownloadedToFolder(result) => {
+                println!("FileDownloadedToFolder");
                 match result {
                     Ok((file_name, bytes, folder)) => {
                         let file_path = folder.join(&file_name);
@@ -309,6 +368,8 @@ impl State {
                 Task::none()
             }
             Message::UploadFile => {
+                println!("UploadFile");
+                let auth_header = self.get_auth_header();
                 Task::perform(
                     async move {
                         let picked: Result<Option<std::path::PathBuf>, String> = tokio::task::spawn_blocking(|| {
@@ -343,6 +404,7 @@ impl State {
                             name: file_name,
                             size: bytes.len(),
                             bytes,
+                            auth_header,
                         }))
                     },
                     Message::FileSelected,
@@ -350,11 +412,13 @@ impl State {
             }
 
             Message::FileSelected(result) => {
+                println!("FileSelected");
                 match result {
                     Ok(Some(file_data)) => {
                         let client = Client::new();
                         let file_name = file_data.name.clone();
                         let bytes = file_data.bytes;
+                        let auth_header = file_data.auth_header;
 
                         Task::perform(
                             async move {
@@ -365,7 +429,12 @@ impl State {
                                     .part("file", part);
 
                                 let url = format!("{BASE_URL}/files");
-                                let resp: reqwest::Response = client.post(&url).multipart(form).send().await
+                                let mut req = client.post(&url).multipart(form);
+                                if let Some(token) = auth_header {
+                                    req = req.header("Authorization", token);
+                                    println!("{:?}",req);
+                                }
+                                let resp: reqwest::Response = req.send().await
                                     .map_err(|e| e.to_string())?;
 
                                 if resp.status().is_success() {
@@ -393,6 +462,7 @@ impl State {
             }
 
             Message::UploadResult(result) => {
+                println!("UploadResult");
                 match result {
                     Ok(_uploaded_name) => {
                         self.upload_loading = false;
@@ -408,16 +478,21 @@ impl State {
                 }
                 Task::none()
             }
-            Message::UploadProgress(_) => Task::none(),
             Message::DownloadNextFile => {
+                println!("DownloadNextFile");
                 if let Some(file_info) = self.files_to_download.first() {
                     let client = Client::new();
                     let url = format!("{BASE_URL}/files/{}", file_info.name);
                     let file_name = file_info.name.clone();
                     let folder = self.download_folder.clone().unwrap();
+                    let auth_header = self.get_auth_header();
 
                     return Task::perform(async move {
-                        match client.get(&url).send().await {
+                        let mut req = client.get(&url);
+                        if let Some(token) = auth_header {
+                            req = req.header("Authorization", token);
+                        }
+                        match req.send().await {
                             Ok(resp) if resp.status().is_success() => {
                                 match resp.bytes().await {
                                     Ok(bytes) => Ok((file_name, bytes.to_vec(), folder)),
@@ -432,6 +507,7 @@ impl State {
                 Task::none()
             }
             Message::FileDownloadedToLocal(result) => {
+                println!("FileDownloadedToLocal");
                 match result {
                     Ok((file_name, bytes, folder)) => {
                         let file_path = folder.join(&file_name);
@@ -443,7 +519,7 @@ impl State {
                         }
                         self.files_to_download.remove(0);
                         if self.files_to_download.is_empty() {
-                            return self.check_and_sync_files();
+                            return Task::none();
                         }
                         return Task::perform(async { Message::DownloadNextFile }, |m| m);
                     }
@@ -451,40 +527,40 @@ impl State {
                         eprintln!("Download failed: {e}");
                         self.files_to_download.remove(0);
                         if self.files_to_download.is_empty() {
-                            return self.check_and_sync_files();
+                            return Task::none();
                         }
                         return Task::perform(async { Message::DownloadNextFile }, |m| m);
                     }
                 }
             }
-            Message::FileModified(file_name) => {
-                self.modified_files.insert(file_name.clone());
-                return Task::perform(async move {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                    Message::SyncFile(file_name)
-                }, |m| m);
-            }
             Message::SyncFile(file_name) => {
+                println!("SyncFile");
                 if let Some(ref folder) = self.download_folder {
                     let file_path = folder.join(&file_name);
                     if file_path.exists() && self.modified_files.contains(&file_name) {
                         self.modified_files.remove(&file_name);
                         let client = Client::new();
                         let file_name_clone = file_name.clone();
-                        
+                        let auth_header = self.get_auth_header();
+
                         return Task::perform(async move {
                             let bytes = match tokio::fs::read(&file_path).await {
                                 Ok(b) => b,
                                 Err(e) => return Err(format!("Read error: {e}")),
                             };
-                            
+
                             let part = reqwest::multipart::Part::bytes(bytes.to_vec())
                                 .file_name(file_name_clone.clone());
                             let form = reqwest::multipart::Form::new()
                                 .part("file", part);
                             let url = format!("{BASE_URL}/files");
-                            
-                            match client.post(&url).multipart(form).send().await {
+
+                            let mut req = client.post(&url).multipart(form);
+                            if let Some(token) = auth_header {
+                                req = req.header("Authorization", token);
+                            }
+
+                            match req.send().await {
                                 Ok(resp) if resp.status().is_success() => Ok(file_name_clone),
                                 Ok(resp) => Err(format!("HTTP {}", resp.status())),
                                 Err(e) => Err(e.to_string()),
@@ -495,6 +571,7 @@ impl State {
                 Task::none()
             }
             Message::FileSynced(result) => {
+                println!("FileSynced");
                 match result {
                     Ok(name) => {
                         println!("File synced: {}", name);
@@ -516,8 +593,27 @@ impl State {
                 Task::none()
             }
             Message::FileChangesChecked => {
+                println!("FileChangesChecked");
                 self.check_file_changes();
                 Task::none()
+            }
+            Message::SyncAllFiles => {
+                println!("SyncAllFiles");
+                self.check_and_sync_files()
+            }
+            Message::Logout => {
+                let client = Client::new();
+                let auth_header = self.get_auth_header();
+                
+                Task::perform(async move {
+                    let url = format!("{BASE_URL}/auth/logout");
+                    let mut req = client.post(&url);
+                    if let Some(token) = auth_header {
+                        req = req.header("Authorization", token);
+                    }
+                    let _ = req.send().await;
+                    Message::AuthResult(Err("Logged out".to_string()))
+                }, |m| m)
             }
         }
     }
@@ -584,6 +680,11 @@ impl State {
                         }
                     }
                 }
+            }
+
+            if changes_to_log.len() == 0 {
+                self.add_log("No changes spotted".to_string(), LogType::Info);
+                return;
             }
             
             for (file_name, old_content, new_content) in changes_to_log {
@@ -678,7 +779,19 @@ impl State {
             ..Default::default()
         });
 
-        let header = row![clear_button, check_changes_button].spacing(10);
+        let sync_button = button(
+            row![text("Синхронизировать").size(12)]
+                .spacing(8)
+                .align_y(Alignment::Center),
+        )
+        .on_press(Message::SyncAllFiles)
+        .padding([6, 12])
+        .style(move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
+            background: Some(Color::from_rgb(0.2, 0.8, 0.3).into()),
+            ..Default::default()
+        });
+
+        let header = row![clear_button, check_changes_button, sync_button].spacing(10);
 
         let terminal_content = if logs.is_empty() {
             column![text("Нет логов").color(Color::from_rgb(0.5, 0.5, 0.5)).size(14)]
@@ -807,7 +920,7 @@ impl State {
         if self.is_authenticated {
             let main_content = self.create_main_window();
             let terminal_content = self.create_terminal_tab();
-            
+
             let tab_button_style = |active: bool| -> container::Style {
                 if active {
                     container::Style {
@@ -849,13 +962,31 @@ impl State {
             let tab_bar = row![tab1, tab2]
                 .spacing(5);
 
+            let user_info = self.current_user.as_ref().map(|user| {
+                text(format!("{} ({})", user.username, user.login)).size(14)
+            });
+            
+            let logout_button = button(
+                row![text("Выйти").size(14)]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+            )
+            .on_press(Message::Logout)
+            .padding([8, 16])
+            .style(move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
+                background: Some(Color::from_rgb(0.8, 0.2, 0.2).into()),
+                ..Default::default()
+            });
+
+            let header_row = row![user_info, logout_button].spacing(10);
+
             let content = match self.active_tab {
                 0 => main_content,
                 _ => terminal_content,
             };
 
-            return column![tab_bar, content]
-                .spacing(0)
+            return column![header_row, tab_bar, content]
+                .spacing(10)
                 .into();
         }
 
