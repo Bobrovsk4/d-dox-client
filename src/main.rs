@@ -6,6 +6,8 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::collections::HashSet;
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub enum LogType {
@@ -19,6 +21,9 @@ pub enum LogType {
     GitAdded,
     GitModified,
     GitDeleted,
+    DiffHeader,
+    DiffAdded,
+    DiffRemoved,
 }
 
 impl LogType {
@@ -34,6 +39,9 @@ impl LogType {
             LogType::GitAdded => Color::from_rgb(0.2, 0.8, 0.2),
             LogType::GitModified => Color::from_rgb(1.0, 0.8, 0.0),
             LogType::GitDeleted => Color::from_rgb(1.0, 0.3, 0.3),
+            LogType::DiffHeader => Color::from_rgb(0.0, 0.8, 0.8),
+            LogType::DiffAdded => Color::from_rgb(0.2, 0.8, 0.2),
+            LogType::DiffRemoved => Color::from_rgb(1.0, 0.3, 0.3),
         }
     }
 }
@@ -42,6 +50,13 @@ impl LogType {
 pub struct LogEntry {
     pub message: String,
     pub log_type: LogType,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrackedFile {
+    pub path: PathBuf,
+    pub content: String,
+    pub last_modified: u64,
 }
 
 #[derive(Default)]
@@ -57,6 +72,7 @@ pub struct State {
     modified_files: HashSet<String>,
     active_tab: u32,
     terminal_logs: Vec<LogEntry>,
+    tracked_files: HashMap<String, TrackedFile>,
 }
 
 impl State {
@@ -119,6 +135,7 @@ pub enum Message {
     FileSynced(Result<String, String>),
     TabChanged(u32),
     ClearTerminal,
+    FileChangesChecked,
 }
 
 const BASE_URL: &str = "http://192.168.1.71:31356";
@@ -419,7 +436,10 @@ impl State {
                     Ok((file_name, bytes, folder)) => {
                         let file_path = folder.join(&file_name);
                         if !file_path.exists() {
-                            let _ = std::fs::write(&file_path, bytes);
+                            let _ = std::fs::write(&file_path, &bytes);
+                        }
+                        if let Ok(content) = std::str::from_utf8(&bytes) {
+                            self.track_file(&file_name, content.to_string());
                         }
                         self.files_to_download.remove(0);
                         if self.files_to_download.is_empty() {
@@ -495,6 +515,10 @@ impl State {
                 self.terminal_logs.clear();
                 Task::none()
             }
+            Message::FileChangesChecked => {
+                self.check_file_changes();
+                Task::none()
+            }
         }
     }
 
@@ -525,6 +549,99 @@ impl State {
         }
     }
 
+    fn track_file(&mut self, file_name: &str, content: String) {
+        if let Some(ref folder) = self.download_folder {
+            let path = folder.join(file_name);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            
+            self.tracked_files.insert(file_name.to_string(), TrackedFile {
+                path,
+                content,
+                last_modified: now,
+            });
+        }
+    }
+
+    fn check_file_changes(&mut self) {
+        if let Some(ref folder) = self.download_folder {
+            let mut changes_to_log: Vec<(String, String, String)> = Vec::new();
+            
+            for (file_name, tracked) in &mut self.tracked_files {
+                let file_path = folder.join(file_name);
+                if file_path.exists() {
+                    if let Ok(new_content) = std::fs::read_to_string(&file_path) {
+                        if new_content != tracked.content {
+                            changes_to_log.push((file_name.clone(), tracked.content.clone(), new_content.clone()));
+                            tracked.content = new_content;
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            tracked.last_modified = now;
+                        }
+                    }
+                }
+            }
+            
+            for (file_name, old_content, new_content) in changes_to_log {
+                self.show_diff(&file_name, &old_content, &new_content);
+            }
+        }
+    }
+
+    fn show_diff(&mut self, file_name: &str, old_content: &str, new_content: &str) {        
+        self.add_log(format!("diff [{}]", file_name), LogType::DiffHeader);
+        self.add_log(format!("--- a/{}", file_name), LogType::DiffHeader);
+        self.add_log(format!("+++ b/{}", file_name), LogType::DiffHeader);
+        
+        let old_lines: Vec<&str> = old_content.lines().collect();
+        let new_lines: Vec<&str> = new_content.lines().collect();
+        
+        let (removed, added) = simple_diff(&old_lines, &new_lines);
+        
+        for line in removed {
+            self.add_log(line, LogType::DiffRemoved);
+        }
+        for line in added {
+            self.add_log(line, LogType::DiffAdded);
+        }
+    }
+}
+
+fn simple_diff(old_lines: &[&str], new_lines: &[&str]) -> (Vec<String>, Vec<String>) {
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    
+    let mut old_idx = 0;
+    let mut new_idx = 0;
+    
+    while old_idx < old_lines.len() || new_idx < new_lines.len() {
+        if old_idx < old_lines.len() && new_idx < new_lines.len() {
+            if old_lines[old_idx] == new_lines[new_idx] {
+                old_idx += 1;
+                new_idx += 1;
+            } else {
+                removed.push(format!("-{}", old_lines[old_idx]));
+                added.push(format!("+{}", new_lines[new_idx]));
+                old_idx += 1;
+                new_idx += 1;
+            }
+        } else if old_idx < old_lines.len() {
+            removed.push(format!("-{}", old_lines[old_idx]));
+            old_idx += 1;
+        } else {
+            added.push(format!("+{}", new_lines[new_idx]));
+            new_idx += 1;
+        }
+    }
+
+    (removed, added)
+}
+
+impl State {
     fn create_terminal_tab(&self) -> Element<'_, Message> {
         let logs: Vec<Element<'_, Message>> = self
             .terminal_logs
@@ -549,7 +666,19 @@ impl State {
             ..Default::default()
         });
 
-        let header = row![clear_button].spacing(10);
+        let check_changes_button = button(
+            row![text("Проверить изменения").size(12)]
+                .spacing(8)
+                .align_y(Alignment::Center),
+        )
+        .on_press(Message::FileChangesChecked)
+        .padding([6, 12])
+        .style(move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
+            background: Some(Color::from_rgb(0.2, 0.6, 0.8).into()),
+            ..Default::default()
+        });
+
+        let header = row![clear_button, check_changes_button].spacing(10);
 
         let terminal_content = if logs.is_empty() {
             column![text("Нет логов").color(Color::from_rgb(0.5, 0.5, 0.5)).size(14)]
