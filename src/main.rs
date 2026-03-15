@@ -1,13 +1,13 @@
 use iced::{
     Alignment, Color, Element, Length, Task,
-    widget::{button, column, container, row, text, text_input, tooltip, scrollable},
+    widget::{button, column, container, row, scrollable, text, text_input, tooltip},
 };
+use jsonwebtoken::{DecodingKey, Validation, decode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use jsonwebtoken::{decode, DecodingKey, Validation};
-use std::path::PathBuf;
-use std::collections::HashSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
@@ -73,7 +73,7 @@ pub struct State {
     download_folder: Option<PathBuf>,
     files_to_download: Vec<FileInfo>,
     modified_files: HashSet<String>,
-    active_tab: u32,//
+    active_tab: u32,
     terminal_logs: Vec<LogEntry>,
     tracked_files: HashMap<String, TrackedFile>,
 }
@@ -151,8 +151,8 @@ pub enum Message {
     DownloadNextFile,
     FileDownloadedToLocal(Result<(String, Vec<u8>, PathBuf), String>),
     FileDownloadedToFolder(Result<(String, Vec<u8>, PathBuf), String>),
-    SyncFile(String),
-    FileSynced(Result<String, String>),
+    SyncFile(String, Vec<String>),
+    FileSyncedResult(Result<String, String>, Vec<String>),
     TabChanged(u32),
     ClearTerminal,
     FileChangesChecked,
@@ -164,9 +164,11 @@ const BASE_URL: &str = "http://192.168.1.71:31356";
 
 impl State {
     fn get_auth_header(&self) -> Option<String> {
-        self.jwt_token.as_ref().map(|token| format!("Bearer {token}"))
+        self.jwt_token
+            .as_ref()
+            .map(|token| format!("Bearer {token}"))
     }
-    
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::LoginChanged(login) => {
@@ -180,7 +182,6 @@ impl State {
                 Task::none()
             }
             Message::AuthSubmit => {
-                println!("AuthSubmit");
                 if self.auth_state.login.is_empty() {
                     self.auth_state.error = Some("Введите логин".to_string());
                     return Task::none();
@@ -223,7 +224,6 @@ impl State {
                 )
             }
             Message::AuthResult(result) => {
-                println!("AuthResult");
                 match result {
                     Ok(auth_resp) => {
                         let secret = "v7SWenu8m9aPQuDkL6pw";
@@ -262,11 +262,9 @@ impl State {
                 Task::none()
             }
             Message::FilesFetch => {
-                println!("FilesFetch");
                 self.files_loading = true;
                 let client = Client::new();
                 let auth_header = self.get_auth_header();
-                println!("Auth header: {:?}", auth_header);
                 Task::perform(
                     async move {
                         let url = format!("{BASE_URL}/files");
@@ -286,7 +284,7 @@ impl State {
                                 let body = resp.text().await.unwrap_or_default();
                                 println!("Server error response: {}", body);
                                 Err(format!("HTTP {}", status))
-                            },
+                            }
                             Err(e) => Err(e.to_string()),
                         }
                     },
@@ -294,14 +292,17 @@ impl State {
                 )
             }
             Message::FilesReceived(result) => {
-                println!("FilesReceived");
                 self.files_loading = false;
                 match result {
                     Ok(files) => {
-                        self.add_log(format!("Files fetched: {} files", files.len()), LogType::GitBranch);
+                        self.add_log(
+                            format!("Files fetched: {} files", files.len()),
+                            LogType::GitBranch,
+                        );
                         self.files = files.clone();
                         if self.download_folder.is_none() {
-                            self.download_folder = Some(std::env::current_dir().unwrap().join("downloads"));
+                            self.download_folder =
+                                Some(std::env::current_dir().unwrap().join("downloads"));
                         }
                         if let Some(ref folder) = self.download_folder {
                             let _ = std::fs::create_dir_all(folder);
@@ -319,7 +320,6 @@ impl State {
                 Task::none()
             }
             Message::FileClicked(file_info) => {
-                println!("FileClicked");
                 if let Some(ref folder) = self.download_folder {
                     let file_path = folder.join(&file_info.name);
                     if file_path.exists() {
@@ -331,28 +331,30 @@ impl State {
                         let folder = folder.clone();
                         let auth_header = self.get_auth_header();
 
-                        return Task::perform(async move {
-                            let mut req = client.get(&url);
-                            if let Some(token) = auth_header {
-                                req = req.header("Authorization", token);
-                            }
-                            match req.send().await {
-                                Ok(resp) if resp.status().is_success() => {
-                                    match resp.bytes().await {
-                                        Ok(bytes) => Ok((file_name, bytes.to_vec(), folder)),
-                                        Err(e) => Err(format!("Read error: {e}")),
-                                    }
+                        return Task::perform(
+                            async move {
+                                let mut req = client.get(&url);
+                                if let Some(token) = auth_header {
+                                    req = req.header("Authorization", token);
                                 }
-                                Ok(resp) => Err(format!("HTTP {}", resp.status())),
-                                Err(e) => Err(e.to_string()),
-                            }
-                        }, Message::FileDownloadedToFolder);
+                                match req.send().await {
+                                    Ok(resp) if resp.status().is_success() => {
+                                        match resp.bytes().await {
+                                            Ok(bytes) => Ok((file_name, bytes.to_vec(), folder)),
+                                            Err(e) => Err(format!("Read error: {e}")),
+                                        }
+                                    }
+                                    Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                                    Err(e) => Err(e.to_string()),
+                                }
+                            },
+                            Message::FileDownloadedToFolder,
+                        );
                     }
                 }
                 Task::none()
             }
             Message::FileDownloadedToFolder(result) => {
-                println!("FileDownloadedToFolder");
                 match result {
                     Ok((file_name, bytes, folder)) => {
                         let file_path = folder.join(&file_name);
@@ -368,17 +370,17 @@ impl State {
                 Task::none()
             }
             Message::UploadFile => {
-                println!("UploadFile");
                 let auth_header = self.get_auth_header();
                 Task::perform(
                     async move {
-                        let picked: Result<Option<std::path::PathBuf>, String> = tokio::task::spawn_blocking(|| {
-                            rfd::FileDialog::new()
-                                .set_title("Выберите файл для загрузки")
-                                .pick_file()
-                        })
-                        .await
-                        .map_err(|e| format!("Dialog error: {e}"));
+                        let picked: Result<Option<std::path::PathBuf>, String> =
+                            tokio::task::spawn_blocking(|| {
+                                rfd::FileDialog::new()
+                                    .set_title("Выберите файл для загрузки")
+                                    .pick_file()
+                            })
+                            .await
+                            .map_err(|e| format!("Dialog error: {e}"));
 
                         let Ok(picked) = picked else {
                             return Err(picked.unwrap_err());
@@ -411,58 +413,54 @@ impl State {
                 )
             }
 
-            Message::FileSelected(result) => {
-                println!("FileSelected");
-                match result {
-                    Ok(Some(file_data)) => {
-                        let client = Client::new();
-                        let file_name = file_data.name.clone();
-                        let bytes = file_data.bytes;
-                        let auth_header = file_data.auth_header;
+            Message::FileSelected(result) => match result {
+                Ok(Some(file_data)) => {
+                    let client = Client::new();
+                    let file_name = file_data.name.clone();
+                    let bytes = file_data.bytes;
+                    let auth_header = file_data.auth_header;
 
-                        Task::perform(
-                            async move {
-                                let part = reqwest::multipart::Part::bytes(bytes)
-                                    .file_name(file_name.clone());
+                    Task::perform(
+                        async move {
+                            let part =
+                                reqwest::multipart::Part::bytes(bytes).file_name(file_name.clone());
 
-                                let form = reqwest::multipart::Form::new()
-                                    .part("file", part);
+                            let form = reqwest::multipart::Form::new().part("file", part);
 
-                                let url = format!("{BASE_URL}/files");
-                                let mut req = client.post(&url).multipart(form);
-                                if let Some(token) = auth_header {
-                                    req = req.header("Authorization", token);
-                                    println!("{:?}",req);
+                            let url = format!("{BASE_URL}/files");
+                            let mut req = client.post(&url).multipart(form);
+                            if let Some(token) = auth_header {
+                                req = req.header("Authorization", token);
+                                println!("{:?}", req);
+                            }
+                            let resp: reqwest::Response =
+                                req.send().await.map_err(|e| e.to_string())?;
+
+                            if resp.status().is_success() {
+                                match resp.json::<serde_json::Value>().await {
+                                    Ok(v) => Ok(v["uploaded"]
+                                        .as_array()
+                                        .and_then(|arr: &Vec<serde_json::Value>| arr.first())
+                                        .and_then(|v: &serde_json::Value| v.as_str())
+                                        .unwrap_or(&file_name)
+                                        .to_string()),
+                                    Err(_) => Ok(file_name),
                                 }
-                                let resp: reqwest::Response = req.send().await
-                                    .map_err(|e| e.to_string())?;
-
-                                if resp.status().is_success() {
-                                    match resp.json::<serde_json::Value>().await {
-                                        Ok(v) => Ok(v["uploaded"].as_array()
-                                            .and_then(|arr: &Vec<serde_json::Value>| arr.first())
-                                            .and_then(|v: &serde_json::Value| v.as_str())
-                                            .unwrap_or(&file_name)
-                                            .to_string()),
-                                        Err(_) => Ok(file_name),
-                                    }
-                                } else {
-                                    Err(format!("HTTP {}", resp.status()))
-                                }
-                            },
-                            Message::UploadResult,
-                        )
-                    }
-                    Ok(None) => Task::none(),
-                    Err(e) => {
-                        self.upload_error = Some(format!("Ошибка загрузки: {e}"));
-                        Task::none()
-                    }
+                            } else {
+                                Err(format!("HTTP {}", resp.status()))
+                            }
+                        },
+                        Message::UploadResult,
+                    )
                 }
-            }
+                Ok(None) => Task::none(),
+                Err(e) => {
+                    self.upload_error = Some(format!("Ошибка загрузки: {e}"));
+                    Task::none()
+                }
+            },
 
             Message::UploadResult(result) => {
-                println!("UploadResult");
                 match result {
                     Ok(_uploaded_name) => {
                         self.upload_loading = false;
@@ -479,7 +477,6 @@ impl State {
                 Task::none()
             }
             Message::DownloadNextFile => {
-                println!("DownloadNextFile");
                 if let Some(file_info) = self.files_to_download.first() {
                     let client = Client::new();
                     let url = format!("{BASE_URL}/files/{}", file_info.name);
@@ -487,99 +484,120 @@ impl State {
                     let folder = self.download_folder.clone().unwrap();
                     let auth_header = self.get_auth_header();
 
-                    return Task::perform(async move {
-                        let mut req = client.get(&url);
-                        if let Some(token) = auth_header {
-                            req = req.header("Authorization", token);
-                        }
-                        match req.send().await {
-                            Ok(resp) if resp.status().is_success() => {
-                                match resp.bytes().await {
-                                    Ok(bytes) => Ok((file_name, bytes.to_vec(), folder)),
-                                    Err(e) => Err(format!("Read error: {e}")),
-                                }
-                            }
-                            Ok(resp) => Err(format!("HTTP {}", resp.status())),
-                            Err(e) => Err(e.to_string()),
-                        }
-                    }, Message::FileDownloadedToLocal);
-                }
-                Task::none()
-            }
-            Message::FileDownloadedToLocal(result) => {
-                println!("FileDownloadedToLocal");
-                match result {
-                    Ok((file_name, bytes, folder)) => {
-                        let file_path = folder.join(&file_name);
-                        if !file_path.exists() {
-                            let _ = std::fs::write(&file_path, &bytes);
-                        }
-                        if let Ok(content) = std::str::from_utf8(&bytes) {
-                            self.track_file(&file_name, content.to_string());
-                        }
-                        self.files_to_download.remove(0);
-                        if self.files_to_download.is_empty() {
-                            return Task::none();
-                        }
-                        return Task::perform(async { Message::DownloadNextFile }, |m| m);
-                    }
-                    Err(e) => {
-                        eprintln!("Download failed: {e}");
-                        self.files_to_download.remove(0);
-                        if self.files_to_download.is_empty() {
-                            return Task::none();
-                        }
-                        return Task::perform(async { Message::DownloadNextFile }, |m| m);
-                    }
-                }
-            }
-            Message::SyncFile(file_name) => {
-                println!("SyncFile");
-                if let Some(ref folder) = self.download_folder {
-                    let file_path = folder.join(&file_name);
-                    if file_path.exists() && self.modified_files.contains(&file_name) {
-                        self.modified_files.remove(&file_name);
-                        let client = Client::new();
-                        let file_name_clone = file_name.clone();
-                        let auth_header = self.get_auth_header();
-
-                        return Task::perform(async move {
-                            let bytes = match tokio::fs::read(&file_path).await {
-                                Ok(b) => b,
-                                Err(e) => return Err(format!("Read error: {e}")),
-                            };
-
-                            let part = reqwest::multipart::Part::bytes(bytes.to_vec())
-                                .file_name(file_name_clone.clone());
-                            let form = reqwest::multipart::Form::new()
-                                .part("file", part);
-                            let url = format!("{BASE_URL}/files");
-
-                            let mut req = client.post(&url).multipart(form);
+                    return Task::perform(
+                        async move {
+                            let mut req = client.get(&url);
                             if let Some(token) = auth_header {
                                 req = req.header("Authorization", token);
                             }
-
                             match req.send().await {
-                                Ok(resp) if resp.status().is_success() => Ok(file_name_clone),
+                                Ok(resp) if resp.status().is_success() => {
+                                    match resp.bytes().await {
+                                        Ok(bytes) => Ok((file_name, bytes.to_vec(), folder)),
+                                        Err(e) => Err(format!("Read error: {e}")),
+                                    }
+                                }
                                 Ok(resp) => Err(format!("HTTP {}", resp.status())),
                                 Err(e) => Err(e.to_string()),
                             }
-                        }, Message::FileSynced);
+                        },
+                        Message::FileDownloadedToLocal,
+                    );
+                }
+                Task::none()
+            }
+            Message::FileDownloadedToLocal(result) => match result {
+                Ok((file_name, bytes, folder)) => {
+                    let file_path = folder.join(&file_name);
+                    if !file_path.exists() {
+                        let _ = std::fs::write(&file_path, &bytes);
+                    }
+                    if let Ok(content) = std::str::from_utf8(&bytes) {
+                        self.track_file(&file_name, content.to_string());
+                    }
+                    self.files_to_download.remove(0);
+                    if self.files_to_download.is_empty() {
+                        return Task::none();
+                    }
+                    return Task::perform(async { Message::DownloadNextFile }, |m| m);
+                }
+                Err(e) => {
+                    eprintln!("Download failed: {e}");
+                    self.files_to_download.remove(0);
+                    if self.files_to_download.is_empty() {
+                        return Task::none();
+                    }
+                    return Task::perform(async { Message::DownloadNextFile }, |m| m);
+                }
+            },
+            Message::SyncFile(file_name, files_to_sync) => {
+                if let Some(ref folder) = self.download_folder {
+                    let file_path = folder.join(&file_name);
+                    if file_path.exists() {
+                        let client = Client::new();
+                        let auth_header = self.get_auth_header();
+                        let files_to_sync_clone = files_to_sync.clone();
+
+                        return Task::perform(
+                            async move {
+                                let bytes = match tokio::fs::read(&file_path).await {
+                                    Ok(b) => b,
+                                    Err(e) => return Err(format!("Read error: {e}")),
+                                };
+
+                                let part = reqwest::multipart::Part::bytes(bytes.to_vec())
+                                    .file_name(file_name.clone());
+                                let form = reqwest::multipart::Form::new().part("file", part);
+                                let url = format!("{BASE_URL}/files/sync");
+
+                                let mut req = client.post(&url).multipart(form);
+                                if let Some(token) = auth_header {
+                                    req = req.header("Authorization", token);
+                                    println!("{:?}", req);
+                                }
+
+                                match req.send().await {
+                                    Ok(resp) if resp.status().is_success() => Ok(file_name),
+                                    Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                                    Err(e) => Err(e.to_string()),
+                                }
+                            },
+                            move |result| Message::FileSyncedResult(result, files_to_sync_clone),
+                        );
                     }
                 }
                 Task::none()
             }
-            Message::FileSynced(result) => {
-                println!("FileSynced");
+            Message::FileSyncedResult(result, mut files_to_sync) => {
                 match result {
                     Ok(name) => {
+                        files_to_sync.remove(0);
+                        self.modified_files.remove(&name);
                         println!("File synced: {}", name);
                         self.add_log(format!("Synced: {}", name), LogType::GitModified);
+
+                        if let Some(ref folder) = self.download_folder {
+                            if let Ok(content) = std::fs::read_to_string(folder.join(&name)) {
+                                self.track_file(&name, content);
+                            }
+                        }
+
+                        if !files_to_sync.is_empty() {
+                            return self.sync_next_file(files_to_sync);
+                        }
+                        self.add_log(
+                            "All files synced successfully".to_string(),
+                            LogType::Success,
+                        );
                     }
                     Err(e) => {
+                        files_to_sync.remove(0);
                         eprintln!("Sync failed: {e}");
                         self.add_log(format!("Sync failed: {}", e), LogType::Error);
+
+                        if !files_to_sync.is_empty() {
+                            return self.sync_next_file(files_to_sync);
+                        }
                     }
                 }
                 Task::none()
@@ -593,47 +611,63 @@ impl State {
                 Task::none()
             }
             Message::FileChangesChecked => {
-                println!("FileChangesChecked");
-                self.check_file_changes();
-                Task::none()
+                return self.check_file_changes();
             }
-            Message::SyncAllFiles => {
-                println!("SyncAllFiles");
-                self.check_and_sync_files()
-            }
+            Message::SyncAllFiles => self.check_and_sync_files(),
             Message::Logout => {
                 let client = Client::new();
                 let auth_header = self.get_auth_header();
-                
-                Task::perform(async move {
-                    let url = format!("{BASE_URL}/auth/logout");
-                    let mut req = client.post(&url);
-                    if let Some(token) = auth_header {
-                        req = req.header("Authorization", token);
-                    }
-                    let _ = req.send().await;
-                    Message::AuthResult(Err("Logged out".to_string()))
-                }, |m| m)
+
+                Task::perform(
+                    async move {
+                        let url = format!("{BASE_URL}/auth/logout");
+                        let mut req = client.post(&url);
+                        if let Some(token) = auth_header {
+                            req = req.header("Authorization", token);
+                        }
+                        let _ = req.send().await;
+                        Message::AuthResult(Err("Logged out".to_string()))
+                    },
+                    |m| m,
+                )
             }
         }
     }
 
     fn check_and_sync_files(&mut self) -> Task<Message> {
         if let Some(ref folder) = self.download_folder {
-            if let Ok(entries) = std::fs::read_dir(folder) {
-                for entry in entries.flatten() {
-                    if let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) {
-                        if self.files.iter().any(|f| f.name == name) {
-                            self.modified_files.insert(name);
+            for (file_name, tracked) in &mut self.tracked_files {
+                let file_path = folder.join(file_name);
+                if file_path.exists() {
+                    if let Ok(new_content) = std::fs::read_to_string(&file_path) {
+                        if new_content != tracked.content {
+                            self.modified_files.insert(file_name.clone());
                         }
                     }
                 }
             }
         }
-        if let Some(file_name) = self.modified_files.iter().next().cloned() {
-            return Task::perform(async move {
-                Message::SyncFile(file_name)
-            }, |m| m);
+
+        let files_to_sync: Vec<String> = self.modified_files.iter().cloned().collect();
+
+        if files_to_sync.is_empty() {
+            self.add_log("No files to sync".to_string(), LogType::Info);
+            return Task::none();
+        }
+
+        self.add_log(
+            format!("Found {} file(s) to sync", files_to_sync.len()),
+            LogType::GitBranch,
+        );
+        self.sync_next_file(files_to_sync)
+    }
+
+    fn sync_next_file(&self, files_to_sync: Vec<String>) -> Task<Message> {
+        if let Some(file_name) = files_to_sync.first().cloned() {
+            return Task::perform(
+                async move { Message::SyncFile(file_name, files_to_sync) },
+                |m| m,
+            );
         }
         Task::none()
     }
@@ -652,57 +686,69 @@ impl State {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            
-            self.tracked_files.insert(file_name.to_string(), TrackedFile {
-                path,
-                content,
-                last_modified: now,
-            });
+
+            self.tracked_files.insert(
+                file_name.to_string(),
+                TrackedFile {
+                    path,
+                    content,
+                    last_modified: now,
+                },
+            );
         }
     }
 
-    fn check_file_changes(&mut self) {
+    fn check_file_changes(&mut self) -> Task<Message> {
         if let Some(ref folder) = self.download_folder {
             let mut changes_to_log: Vec<(String, String, String)> = Vec::new();
-            
+
             for (file_name, tracked) in &mut self.tracked_files {
                 let file_path = folder.join(file_name);
                 if file_path.exists() {
                     if let Ok(new_content) = std::fs::read_to_string(&file_path) {
                         if new_content != tracked.content {
-                            changes_to_log.push((file_name.clone(), tracked.content.clone(), new_content.clone()));
+                            changes_to_log.push((
+                                file_name.clone(),
+                                tracked.content.clone(),
+                                new_content.clone(),
+                            ));
                             tracked.content = new_content;
                             let now = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
                                 .as_secs();
                             tracked.last_modified = now;
+                            self.modified_files.insert(file_name.clone());
                         }
                     }
                 }
             }
 
-            if changes_to_log.len() == 0 {
+            if changes_to_log.is_empty() {
                 self.add_log("No changes spotted".to_string(), LogType::Info);
-                return;
+                return Task::none();
             }
-            
-            for (file_name, old_content, new_content) in changes_to_log {
-                self.show_diff(&file_name, &old_content, &new_content);
+
+            for (file_name, old_content, new_content) in &changes_to_log {
+                self.show_diff(file_name, old_content, new_content);
             }
+
+            self.add_log(
+                format!("Found {} changed file(s)", changes_to_log.len()),
+                LogType::Warning,
+            );
         }
+        Task::none()
     }
 
-    fn show_diff(&mut self, file_name: &str, old_content: &str, new_content: &str) {        
+    fn show_diff(&mut self, file_name: &str, old_content: &str, new_content: &str) {
         self.add_log(format!("diff [{}]", file_name), LogType::DiffHeader);
-        self.add_log(format!("--- a/{}", file_name), LogType::DiffHeader);
-        self.add_log(format!("+++ b/{}", file_name), LogType::DiffHeader);
-        
+
         let old_lines: Vec<&str> = old_content.lines().collect();
         let new_lines: Vec<&str> = new_content.lines().collect();
-        
+
         let (removed, added) = simple_diff(&old_lines, &new_lines);
-        
+
         for line in removed {
             self.add_log(line, LogType::DiffRemoved);
         }
@@ -715,10 +761,10 @@ impl State {
 fn simple_diff(old_lines: &[&str], new_lines: &[&str]) -> (Vec<String>, Vec<String>) {
     let mut removed = Vec::new();
     let mut added = Vec::new();
-    
+
     let mut old_idx = 0;
     let mut new_idx = 0;
-    
+
     while old_idx < old_lines.len() || new_idx < new_lines.len() {
         if old_idx < old_lines.len() && new_idx < new_lines.len() {
             if old_lines[old_idx] == new_lines[new_idx] {
@@ -762,10 +808,12 @@ impl State {
         )
         .on_press(Message::ClearTerminal)
         .padding([6, 12])
-        .style(move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
-            background: Some(Color::from_rgb(0.6, 0.2, 0.2).into()),
-            ..Default::default()
-        });
+        .style(
+            move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
+                background: Some(Color::from_rgb(0.6, 0.2, 0.2).into()),
+                ..Default::default()
+            },
+        );
 
         let check_changes_button = button(
             row![text("Проверить изменения").size(12)]
@@ -774,10 +822,12 @@ impl State {
         )
         .on_press(Message::FileChangesChecked)
         .padding([6, 12])
-        .style(move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
-            background: Some(Color::from_rgb(0.2, 0.6, 0.8).into()),
-            ..Default::default()
-        });
+        .style(
+            move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
+                background: Some(Color::from_rgb(0.2, 0.6, 0.8).into()),
+                ..Default::default()
+            },
+        );
 
         let sync_button = button(
             row![text("Синхронизировать").size(12)]
@@ -786,17 +836,23 @@ impl State {
         )
         .on_press(Message::SyncAllFiles)
         .padding([6, 12])
-        .style(move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
-            background: Some(Color::from_rgb(0.2, 0.8, 0.3).into()),
-            ..Default::default()
-        });
+        .style(
+            move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
+                background: Some(Color::from_rgb(0.2, 0.8, 0.3).into()),
+                ..Default::default()
+            },
+        );
 
         let header = row![clear_button, check_changes_button, sync_button].spacing(10);
 
         let terminal_content = if logs.is_empty() {
-            column![text("Нет логов").color(Color::from_rgb(0.5, 0.5, 0.5)).size(14)]
-                .align_x(Alignment::Center)
-                .padding(20)
+            column![
+                text("Нет логов")
+                    .color(Color::from_rgb(0.5, 0.5, 0.5))
+                    .size(14)
+            ]
+            .align_x(Alignment::Center)
+            .padding(20)
         } else {
             column(logs)
         };
@@ -804,7 +860,7 @@ impl State {
         let scrollable_terminal = container(
             scrollable(terminal_content)
                 .width(Length::Fill)
-                .height(Length::Fill)
+                .height(Length::Fill),
         )
         .padding(10)
         .style(move |_| container::Style {
@@ -864,8 +920,12 @@ impl State {
                             .height(Length::Fixed(file_size))
                             .padding(10);
 
-                        tooltip(btn, text(&file_info.name).size(14), tooltip::Position::FollowCursor)
-                            .into()
+                        tooltip(
+                            btn,
+                            text(&file_info.name).size(14),
+                            tooltip::Position::FollowCursor,
+                        )
+                        .into()
                     })
                     .collect();
 
@@ -884,36 +944,40 @@ impl State {
         )
         .on_press(Message::UploadFile)
         .padding([8, 16])
-        .style(move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
-            background: Some(Color::from_rgb(0.2, 0.6, 0.3).into()),
-            ..Default::default()
-        });
+        .style(
+            move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
+                background: Some(Color::from_rgb(0.2, 0.6, 0.3).into()),
+                ..Default::default()
+            },
+        );
 
         let header_row = row![refresh_button, upload_button].spacing(10);
 
         let content = if self.files_loading {
             column![text("Загрузка списка...").size(16)].align_x(Alignment::Center)
         } else if self.upload_loading {
-            column![
-                text("Загрузка файла...").size(16),
-            ].align_x(Alignment::Center)
+            column![text("Загрузка файла...").size(16),].align_x(Alignment::Center)
         } else {
             let mut content_col: Vec<Element<'_, Message>> = vec![header_row.into()];
-            
+
             if let Some(e) = &self.upload_error {
                 content_col.push(
                     container(text(e).color(Color::from_rgb(1.0, 0.3, 0.3)))
                         .padding(5)
-                        .into()
+                        .into(),
                 );
             }
-            
+
             content_col.push(column(files_rows).spacing(10).padding(10).into());
-            
+
             column(content_col).spacing(10)
         };
 
-        container(content).width(Length::Fill).height(Length::Fill).padding(20).into()
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(20)
+            .into()
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -948,24 +1012,24 @@ impl State {
             let tab1 = button(
                 container(text("Главная").size(14))
                     .padding([10, 20])
-                    .style(move |_| tab_button_style(self.active_tab == 0))
+                    .style(move |_| tab_button_style(self.active_tab == 0)),
             )
             .on_press(Message::TabChanged(0));
 
             let tab2 = button(
                 container(text("Терминал").size(14))
                     .padding([10, 20])
-                    .style(move |_| tab_button_style(self.active_tab == 1))
+                    .style(move |_| tab_button_style(self.active_tab == 1)),
             )
             .on_press(Message::TabChanged(1));
 
-            let tab_bar = row![tab1, tab2]
-                .spacing(5);
+            let tab_bar = row![tab1, tab2].spacing(5);
 
-            let user_info = self.current_user.as_ref().map(|user| {
-                text(format!("{} ({})", user.username, user.login)).size(14)
-            });
-            
+            let user_info = self
+                .current_user
+                .as_ref()
+                .map(|user| text(format!("{} ({})", user.username, user.login)).size(14));
+
             let logout_button = button(
                 row![text("Выйти").size(14)]
                     .spacing(8)
@@ -973,10 +1037,12 @@ impl State {
             )
             .on_press(Message::Logout)
             .padding([8, 16])
-            .style(move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
-                background: Some(Color::from_rgb(0.8, 0.2, 0.2).into()),
-                ..Default::default()
-            });
+            .style(
+                move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
+                    background: Some(Color::from_rgb(0.8, 0.2, 0.2).into()),
+                    ..Default::default()
+                },
+            );
 
             let header_row = row![user_info, logout_button].spacing(10);
 
@@ -985,9 +1051,7 @@ impl State {
                 _ => terminal_content,
             };
 
-            return column![header_row, tab_bar, content]
-                .spacing(10)
-                .into();
+            return column![header_row, tab_bar, content].spacing(10).into();
         }
 
         let error_message = self.auth_state.error.as_ref().map(|error| {
@@ -995,7 +1059,10 @@ impl State {
                 .padding([5, 10])
                 .style(|_| container::Style {
                     background: Some(Color::from_rgb(0.8, 0.2, 0.2).into()),
-                    border: iced::border::Border { radius: 5.0.into(), ..Default::default() },
+                    border: iced::border::Border {
+                        radius: 5.0.into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 })
         });
@@ -1018,7 +1085,10 @@ impl State {
                 .width(Length::Fixed(300.0))
                 .style(|_| container::Style {
                     background: Some(Color::from_rgb(0.15, 0.15, 0.15).into()),
-                    border: iced::border::Border { radius: 10.0.into(), ..Default::default() },
+                    border: iced::border::Border {
+                        radius: 10.0.into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 }),
         )
