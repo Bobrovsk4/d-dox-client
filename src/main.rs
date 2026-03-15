@@ -95,10 +95,17 @@ impl Default for AuthState {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct AuthorInfo {
+    pub id: i32,
+    pub login: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct FileInfo {
     pub name: String,
     pub size: usize,
     pub last_modified: Option<String>,
+    pub author: Option<AuthorInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -888,6 +895,7 @@ impl State {
         .padding([8, 16]);
 
         let file_size: f32 = 100.0;
+        let file_height: f32 = 140.0;
         let columns: usize = 5;
 
         let files_rows: Vec<Element<'_, Message>> = self
@@ -897,6 +905,12 @@ impl State {
                 let file_buttons: Vec<Element<'_, Message>> = chunk
                     .iter()
                     .map(|file_info| {
+                        let author_text = file_info
+                            .author
+                            .as_ref()
+                            .map(|a| format!("[{}]", a.login))
+                            .unwrap_or_default();
+
                         let content = column![
                             text("🗎").size(44),
                             container(
@@ -905,10 +919,11 @@ impl State {
                                     .shaping(text::Shaping::Advanced)
                             )
                             .width(Length::Fixed(file_size))
-                            .height(Length::Fixed(40.0))
+                            .height(Length::Fixed(20.0))
                             .align_x(iced::alignment::Horizontal::Center)
-                            .center_y(Length::Fixed(40.0))
+                            .center_y(Length::Fixed(20.0))
                             .clip(true),
+                            text(author_text).size(9),
                             text(format!("{} KB", file_info.size / 1024)).size(9),
                         ]
                         .spacing(4)
@@ -917,7 +932,7 @@ impl State {
                         let btn = button(content)
                             .on_press(Message::FileClicked(file_info.clone()))
                             .width(Length::Fixed(file_size))
-                            .height(Length::Fixed(file_size))
+                            .height(Length::Fixed(file_height))
                             .padding(10);
 
                         tooltip(
