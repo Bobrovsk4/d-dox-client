@@ -46,6 +46,8 @@ pub struct TrackedFile {
     pub _path: PathBuf,
     pub content: String,
     pub last_modified: u64,
+    pub version: i32,
+    pub file_id: i32,
 }
 
 #[derive(Default)]
@@ -64,6 +66,14 @@ pub struct State {
     pub active_tab: u32,
     pub terminal_logs: Vec<LogEntry>,
     pub tracked_files: HashMap<String, TrackedFile>,
+    pub version_conflicts: HashMap<String, VersionConflict>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VersionConflict {
+    pub file_name: String,
+    pub local_content: String,
+    pub server_version: i32,
 }
 
 pub struct AuthState {
@@ -84,16 +94,19 @@ impl Default for AuthState {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthorInfo {
-    pub _id: i32,
+    pub id: i32,
     pub login: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FileInfo {
+    pub id: i32,
     pub name: String,
-    pub size: usize,
-    pub _last_modified: Option<String>,
-    pub author: Option<AuthorInfo>,
+    pub size: i64,
+    pub author: AuthorInfo,
+    pub created_at: String,
+    pub updated_at: String,
+    pub version: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,10 +160,12 @@ pub enum Message {
     FileDownloadedToLocal(Result<(String, Vec<u8>, PathBuf), String>),
     FileDownloadedToFolder(Result<(String, Vec<u8>, PathBuf), String>),
     SyncFile(String, Vec<String>),
-    FileSyncedResult(Result<String, String>, Vec<String>),
+    FileSyncedResult(Result<(String, i32), String>, Vec<String>),
     TabChanged(u32),
     ClearTerminal,
     FileChangesChecked,
     SyncAllFiles,
     Logout,
+    ResolveConflictKeepLocal(String),
+    ResolveConflictKeepServer(String),
 }

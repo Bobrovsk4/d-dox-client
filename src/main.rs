@@ -156,7 +156,23 @@ impl State {
                         if let Some(ref folder) = self.download_folder {
                             let _ = std::fs::create_dir_all(folder);
                         }
-                        self.files_to_download = files;
+                        self.files_to_download = files.clone();
+                        let folder = self.download_folder.clone().unwrap();
+                        for file in &files {
+                            self.tracked_files
+                                .entry(file.name.clone())
+                                .and_modify(|tracked| {
+                                    tracked.version = file.version;
+                                    tracked.file_id = file.id;
+                                })
+                                .or_insert_with(|| TrackedFile {
+                                    _path: folder.join(&file.name),
+                                    content: String::new(),
+                                    last_modified: 0,
+                                    version: file.version,
+                                    file_id: file.id,
+                                });
+                        }
                         if !self.files_to_download.is_empty() {
                             return Task::perform(async { Message::DownloadNextFile }, |m| m);
                         }
@@ -364,6 +380,11 @@ impl State {
                     if let Ok(content) = std::str::from_utf8(&bytes) {
                         self.track_file(&file_name, content.to_string());
                     }
+                    if let Some(file_info) = self.files.iter().find(|f| f.name == file_name) {
+                        if let Some(tracked) = self.tracked_files.get_mut(&file_name) {
+                            tracked.version = file_info.version;
+                        }
+                    }
                     self.files_to_download.remove(0);
                     if self.files_to_download.is_empty() {
                         return Task::none();
@@ -387,6 +408,10 @@ impl State {
                         let auth_header = self.get_auth_header();
                         let files_to_sync_clone = files_to_sync.clone();
 
+                        let tracked = self.tracked_files.get(&file_name);
+                        let file_id = tracked.map(|t| t.file_id).unwrap_or(0);
+                        let version = tracked.map(|t| t.version).unwrap_or(1);
+
                         return Task::perform(
                             async move {
                                 let bytes = match tokio::fs::read(&file_path).await {
@@ -394,20 +419,48 @@ impl State {
                                     Err(e) => return Err(format!("Read error: {e}")),
                                 };
 
-                                let part = reqwest::multipart::Part::bytes(bytes.to_vec())
-                                    .file_name(file_name.clone());
-                                let form = reqwest::multipart::Form::new().part("file", part);
-                                let url = format!("{BASE_URL}/files/sync");
+                                let size = bytes.len() as i64;
 
-                                let mut req = client.post(&url).multipart(form);
-                                if let Some(token) = auth_header {
+                                let sync_url = format!("{BASE_URL}/files/sync");
+
+                                let file_part = reqwest::multipart::Part::bytes(bytes.to_vec())
+                                    .file_name(file_name.clone());
+                                let file_id_part =
+                                    reqwest::multipart::Part::text(file_id.to_string());
+                                let version_part =
+                                    reqwest::multipart::Part::text(version.to_string());
+                                let size_part = reqwest::multipart::Part::text(size.to_string());
+
+                                let form = reqwest::multipart::Form::new()
+                                    .part("file", file_part)
+                                    .part("file_id", file_id_part)
+                                    .part("version", version_part)
+                                    .part("size", size_part);
+
+                                let mut req = client.post(&sync_url).multipart(form);
+                                if let Some(token) = auth_header.clone() {
                                     req = req.header("Authorization", token);
-                                    println!("{:?}", req);
                                 }
 
                                 match req.send().await {
-                                    Ok(resp) if resp.status().is_success() => Ok(file_name),
-                                    Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                                    Ok(resp) if resp.status().is_success() => {
+                                        match resp.json::<serde_json::Value>().await {
+                                            Ok(v) => {
+                                                let new_version = v
+                                                    .get("version")
+                                                    .and_then(|v| v.as_i64())
+                                                    .map(|v| v as i32)
+                                                    .unwrap_or(version + 1);
+                                                Ok((file_name, new_version))
+                                            }
+                                            Err(_) => Ok((file_name, version + 1)),
+                                        }
+                                    }
+                                    Ok(resp) => {
+                                        let status = resp.status();
+                                        let body = resp.text().await.unwrap_or_default();
+                                        Err(format!("Version conflict: {} (HTTP {})", body, status))
+                                    }
                                     Err(e) => Err(e.to_string()),
                                 }
                             },
@@ -419,7 +472,7 @@ impl State {
             }
             Message::FileSyncedResult(result, mut files_to_sync) => {
                 match result {
-                    Ok(name) => {
+                    Ok((name, new_version)) => {
                         files_to_sync.remove(0);
                         self.modified_files.remove(&name);
                         println!("File synced: {}", name);
@@ -428,6 +481,9 @@ impl State {
                         if let Some(ref folder) = self.download_folder {
                             if let Ok(content) = std::fs::read_to_string(folder.join(&name)) {
                                 self.track_file(&name, content);
+                                if let Some(tracked) = self.tracked_files.get_mut(&name) {
+                                    tracked.version = new_version;
+                                }
                             }
                         }
 
@@ -440,9 +496,36 @@ impl State {
                         );
                     }
                     Err(e) => {
+                        let failed_file = files_to_sync.first().cloned().unwrap_or_default();
                         files_to_sync.remove(0);
-                        eprintln!("Sync failed: {e}");
-                        self.add_log(format!("Sync failed: {}", e), LogType::Error);
+                        if e.contains("Version conflict") && !failed_file.is_empty() {
+                            if let Some(ref folder) = self.download_folder {
+                                let file_path = folder.join(&failed_file);
+                                if let Ok(content) = std::fs::read_to_string(&file_path) {
+                                    let server_version = extract_version_from_error(&e);
+
+                                    self.version_conflicts.insert(
+                                        failed_file.clone(),
+                                        VersionConflict {
+                                            file_name: failed_file.clone(),
+                                            local_content: content,
+                                            server_version,
+                                        },
+                                    );
+
+                                    self.add_log(
+                                        format!(
+                                            "Conflict detected for '{}'. Server version: {}",
+                                            failed_file, server_version
+                                        ),
+                                        LogType::Error,
+                                    );
+                                }
+                            }
+                        } else {
+                            eprintln!("Sync failed: {e}");
+                            self.add_log(format!("Sync failed: {}", e), LogType::Error);
+                        }
 
                         if !files_to_sync.is_empty() {
                             return self.sync_next_file(files_to_sync);
@@ -479,6 +562,24 @@ impl State {
                     },
                     |m| m,
                 )
+            }
+            Message::ResolveConflictKeepLocal(file_name) => {
+                self.version_conflicts.remove(&file_name);
+                self.add_log(
+                    format!("Conflict resolved: kept local version of '{}'", file_name),
+                    LogType::Success,
+                );
+                self.modified_files.insert(file_name);
+                Task::none()
+            }
+            Message::ResolveConflictKeepServer(file_name) => {
+                self.version_conflicts.remove(&file_name);
+                self.modified_files.remove(&file_name);
+                self.add_log(
+                    format!("Conflict resolved: kept server version of '{}'", file_name),
+                    LogType::Info,
+                );
+                Task::none()
             }
         }
     }
@@ -536,12 +637,20 @@ impl State {
                 .unwrap()
                 .as_secs();
 
+            let (version, file_id) = self
+                .tracked_files
+                .get(file_name)
+                .map(|t| (t.version, t.file_id))
+                .unwrap_or((1, 0));
+
             self.tracked_files.insert(
                 file_name.to_string(),
                 TrackedFile {
                     _path: path,
                     content,
                     last_modified: now,
+                    version,
+                    file_id,
                 },
             );
         }
@@ -639,6 +748,62 @@ fn simple_diff(old_lines: &[&str], new_lines: &[&str]) -> (Vec<String>, Vec<Stri
 
 impl State {
     fn create_terminal_tab(&self) -> Element<'_, Message> {
+        let mut all_content: Vec<Element<'_, Message>> = Vec::new();
+
+        if !self.version_conflicts.is_empty() {
+            let conflict_header = text("КОНФЛИКТЫ ВЕРСИЙ")
+                .size(16)
+                .color(Color::from_rgb(1.0, 0.5, 0.0))
+                .into();
+            all_content.push(conflict_header);
+            all_content.push(
+                text("Выберите версию для каждого файла:")
+                    .size(12)
+                    .color(Color::WHITE)
+                    .into(),
+            );
+
+            for (file_name, conflict) in &self.version_conflicts {
+                let conflict_row = row![
+                    text(format!("📄 {}", file_name))
+                        .size(12)
+                        .color(Color::from_rgb(1.0, 0.8, 0.0)),
+                    button(text("Локальная").size(10))
+                        .on_press(Message::ResolveConflictKeepLocal(file_name.clone()))
+                        .padding([4, 8])
+                        .style(move |_: &_, _: iced::widget::button::Status| {
+                            iced::widget::button::Style {
+                                background: Some(Color::from_rgb(0.2, 0.6, 0.2).into()),
+                                ..Default::default()
+                            }
+                        },),
+                    button(text(format!("Серверная (v{})", conflict.server_version)).size(10))
+                        .on_press(Message::ResolveConflictKeepServer(file_name.clone()))
+                        .padding([4, 8])
+                        .style(move |_: &_, _: iced::widget::button::Status| {
+                            iced::widget::button::Style {
+                                background: Some(Color::from_rgb(0.2, 0.4, 0.6).into()),
+                                ..Default::default()
+                            }
+                        },),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center);
+
+                all_content.push(conflict_row.into());
+            }
+
+            all_content.push(
+                container(column![].height(Length::Fixed(1.0)))
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(Color::from_rgb(0.3, 0.3, 0.3).into()),
+                        ..Default::default()
+                    })
+                    .into(),
+            );
+        }
+
         let logs: Vec<Element<'_, Message>> = self
             .terminal_logs
             .iter()
@@ -694,7 +859,7 @@ impl State {
 
         let header = row![clear_button, check_changes_button, sync_button].spacing(10);
 
-        let terminal_content = if logs.is_empty() {
+        let terminal_content = if all_content.is_empty() && logs.is_empty() {
             column![
                 text("Нет логов")
                     .color(Color::from_rgb(0.5, 0.5, 0.5))
@@ -703,7 +868,9 @@ impl State {
             .align_x(Alignment::Center)
             .padding(20)
         } else {
-            column(logs)
+            let mut content = all_content;
+            content.extend(logs);
+            column(content)
         };
 
         let scrollable_terminal = container(
@@ -747,11 +914,7 @@ impl State {
                 let file_buttons: Vec<Element<'_, Message>> = chunk
                     .iter()
                     .map(|file_info| {
-                        let author_text = file_info
-                            .author
-                            .as_ref()
-                            .map(|a| format!("[{}]", a.login))
-                            .unwrap_or_default();
+                        let author_text = format!("[{}]", file_info.author.login);
 
                         let content = column![
                             text("🗎").size(44),
@@ -955,6 +1118,25 @@ impl State {
         .center_y(Length::Fill)
         .into()
     }
+}
+
+fn extract_version_from_error(error: &str) -> i32 {
+    if let Some(current_pos) = error.find("current") {
+        let after_current = &error[current_pos + 7..];
+        for ch in after_current.chars() {
+            if ch.is_ascii_digit() {
+                let num_str: String = after_current
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(num) = num_str.parse::<i32>() {
+                    return num;
+                }
+            }
+        }
+    }
+    0
 }
 
 fn main() -> iced::Result {
