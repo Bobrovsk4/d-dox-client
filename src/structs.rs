@@ -82,7 +82,7 @@ pub struct State {
     pub auth_state: AuthState,
     pub is_authenticated: bool,
     pub(crate) jwt_token: Option<String>,
-    pub current_user: Option<UserInfo>,
+    pub current_user: Option<UserResponse>,
     pub files: Vec<FileInfo>,
     pub files_loading: bool,
     pub upload_loading: bool,
@@ -147,23 +147,23 @@ pub struct Claims {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoleInfo {
-    pub id: i32,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserInfo {
+pub struct UserResponse {
     pub id: i32,
     pub username: String,
     pub login: String,
-    pub role: Option<RoleInfo>,
+    pub role: Option<RoleResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthResponse {
     pub token: String,
-    pub user: UserInfo,
+    pub user: UserResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleResponse {
+    pub id: i32,
+    pub name: String,
 }
 
 #[derive(Debug, Clone)]

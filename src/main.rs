@@ -61,7 +61,9 @@ impl State {
                             }
                             Ok(resp) => {
                                 if resp.status() == reqwest::StatusCode::NOT_FOUND {
-                                    Err("Сервер не найден. Проверьте адрес.".to_string())
+                                    Err(format!("Сервер не найден. Проверьте адрес."))
+                                } else if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                                    Err(format!("Ошибка: Неверный логин или пароль"))
                                 } else {
                                     Err(format!("Ошибка: {}", resp.status()))
                                 }
