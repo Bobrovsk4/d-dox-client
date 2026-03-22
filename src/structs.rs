@@ -4,6 +4,33 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+pub struct Theme;
+
+impl Theme {
+    pub const BACKGROUND_PRIMARY: Color = Color::from_rgb(0.09, 0.09, 0.11);
+    pub const BACKGROUND_SECONDARY: Color = Color::from_rgb(0.12, 0.12, 0.14);
+    pub const BACKGROUND_TERTIARY: Color = Color::from_rgb(0.15, 0.15, 0.17);
+    pub const CARD_BACKGROUND: Color = Color::from_rgb(0.14, 0.14, 0.16);
+
+    pub const PRIMARY: Color = Color::from_rgb(0.37, 0.55, 0.95);
+    pub const SUCCESS: Color = Color::from_rgb(0.24, 0.75, 0.45);
+    pub const WARNING: Color = Color::from_rgb(0.95, 0.68, 0.24);
+    pub const ERROR: Color = Color::from_rgb(0.95, 0.33, 0.33);
+    pub const INFO: Color = Color::from_rgb(0.24, 0.65, 0.95);
+
+    pub const TEXT_PRIMARY: Color = Color::from_rgb(0.95, 0.95, 0.95);
+    pub const TEXT_SECONDARY: Color = Color::from_rgb(0.70, 0.70, 0.75);
+    pub const TEXT_MUTED: Color = Color::from_rgb(0.45, 0.45, 0.50);
+
+    pub const RADIUS_SM: f32 = 6.0;
+    pub const RADIUS_MD: f32 = 10.0;
+
+    pub const SPACING_SM: f32 = 8.0;
+    pub const SPACING_MD: f32 = 16.0;
+    pub const SPACING_LG: f32 = 24.0;
+    pub const SPACING_XL: f32 = 32.0;
+}
+
 #[derive(Debug, Clone)]
 pub enum LogType {
     Info,
@@ -21,16 +48,16 @@ pub enum LogType {
 impl LogType {
     pub fn color(&self) -> Color {
         match self {
-            LogType::Info => Color::WHITE,
-            LogType::Success => Color::from_rgb(0.2, 0.8, 0.2),
-            LogType::Warning => Color::from_rgb(1.0, 0.8, 0.0),
-            LogType::Error => Color::from_rgb(1.0, 0.3, 0.3),
-            LogType::GitBranch => Color::from_rgb(0.0, 0.8, 0.8),
-            LogType::GitAdded => Color::from_rgb(0.2, 0.8, 0.2),
-            LogType::GitModified => Color::from_rgb(1.0, 0.8, 0.0),
-            LogType::DiffHeader => Color::from_rgb(0.0, 0.8, 0.8),
-            LogType::DiffAdded => Color::from_rgb(0.2, 0.8, 0.2),
-            LogType::DiffRemoved => Color::from_rgb(1.0, 0.3, 0.3),
+            LogType::Info => Theme::TEXT_PRIMARY,
+            LogType::Success => Theme::SUCCESS,
+            LogType::Warning => Theme::WARNING,
+            LogType::Error => Theme::ERROR,
+            LogType::GitBranch => Theme::INFO,
+            LogType::GitAdded => Theme::SUCCESS,
+            LogType::GitModified => Theme::WARNING,
+            LogType::DiffHeader => Theme::INFO,
+            LogType::DiffAdded => Theme::SUCCESS,
+            LogType::DiffRemoved => Theme::ERROR,
         }
     }
 }
@@ -69,6 +96,7 @@ pub struct State {
     pub version_conflicts: HashMap<String, VersionConflict>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct VersionConflict {
     pub file_name: String,
@@ -92,12 +120,14 @@ impl Default for AuthState {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthorInfo {
     pub id: i32,
     pub login: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct FileInfo {
     pub id: i32,

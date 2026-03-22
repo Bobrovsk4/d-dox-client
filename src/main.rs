@@ -145,7 +145,7 @@ impl State {
                 match result {
                     Ok(files) => {
                         self.add_log(
-                            format!("Files fetched: {} files", files.len()),
+                            format!("Files fetched: {}", files.len()),
                             LogType::GitBranch,
                         );
                         self.files = files.clone();
@@ -751,57 +751,90 @@ impl State {
         let mut all_content: Vec<Element<'_, Message>> = Vec::new();
 
         if !self.version_conflicts.is_empty() {
-            let conflict_header = text("КОНФЛИКТЫ ВЕРСИЙ")
-                .size(16)
-                .color(Color::from_rgb(1.0, 0.5, 0.0))
-                .into();
-            all_content.push(conflict_header);
-            all_content.push(
-                text("Выберите версию для каждого файла:")
-                    .size(12)
-                    .color(Color::WHITE)
-                    .into(),
-            );
+            let conflict_card = container(
+                column![
+                    row![text("КОНФЛИКТЫ ВЕРСИЙ").size(15).color(Theme::WARNING),]
+                        .spacing(Theme::SPACING_SM)
+                        .align_y(Alignment::Center),
+                    text("Выберите версию для каждого файла:")
+                        .size(12)
+                        .color(Theme::TEXT_SECONDARY),
+                ]
+                .spacing(Theme::SPACING_SM),
+            )
+            .padding([12, 16])
+            .width(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(Color::from_rgb(0.25, 0.18, 0.10).into()),
+                border: iced::border::Border {
+                    radius: Theme::RADIUS_SM.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+            all_content.push(conflict_card.into());
+            all_content.push(container(column![].height(Length::Fixed(Theme::SPACING_MD))).into());
 
             for (file_name, conflict) in &self.version_conflicts {
-                let conflict_row = row![
-                    text(format!("📄 {}", file_name))
-                        .size(12)
-                        .color(Color::from_rgb(1.0, 0.8, 0.0)),
-                    button(text("Локальная").size(10))
+                let conflict_item = container(
+                    row![
+                        text(format!("📄 {}", file_name))
+                            .size(12)
+                            .color(Theme::TEXT_PRIMARY),
+                        button(
+                            row![text("Локальная").size(11)]
+                                .spacing(6)
+                                .align_y(Alignment::Center),
+                        )
                         .on_press(Message::ResolveConflictKeepLocal(file_name.clone()))
-                        .padding([4, 8])
-                        .style(move |_: &_, _: iced::widget::button::Status| {
-                            iced::widget::button::Style {
-                                background: Some(Color::from_rgb(0.2, 0.6, 0.2).into()),
+                        .padding([6, 12])
+                        .style(|_, _| button::Style {
+                            background: Some(Theme::SUCCESS.into()),
+                            text_color: Color::WHITE,
+                            border: iced::border::Border {
+                                radius: Theme::RADIUS_SM.into(),
                                 ..Default::default()
-                            }
-                        },),
-                    button(text(format!("Серверная (v{})", conflict.server_version)).size(10))
+                            },
+                            ..Default::default()
+                        }),
+                        button(
+                            row![
+                                text(format!("Серверная (v{})", conflict.server_version)).size(11)
+                            ]
+                            .spacing(6)
+                            .align_y(Alignment::Center),
+                        )
                         .on_press(Message::ResolveConflictKeepServer(file_name.clone()))
-                        .padding([4, 8])
-                        .style(move |_: &_, _: iced::widget::button::Status| {
-                            iced::widget::button::Style {
-                                background: Some(Color::from_rgb(0.2, 0.4, 0.6).into()),
+                        .padding([6, 12])
+                        .style(|_, _| button::Style {
+                            background: Some(Theme::INFO.into()),
+                            text_color: Color::WHITE,
+                            border: iced::border::Border {
+                                radius: Theme::RADIUS_SM.into(),
                                 ..Default::default()
-                            }
-                        },),
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center);
+                            },
+                            ..Default::default()
+                        }),
+                    ]
+                    .spacing(Theme::SPACING_MD)
+                    .align_y(Alignment::Center),
+                )
+                .padding([10, 14])
+                .width(Length::Fill)
+                .style(|_| container::Style {
+                    background: Some(Theme::BACKGROUND_TERTIARY.into()),
+                    border: iced::border::Border {
+                        radius: Theme::RADIUS_SM.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
 
-                all_content.push(conflict_row.into());
+                all_content.push(conflict_item.into());
             }
 
-            all_content.push(
-                container(column![].height(Length::Fixed(1.0)))
-                    .width(Length::Fill)
-                    .style(move |_| container::Style {
-                        background: Some(Color::from_rgb(0.3, 0.3, 0.3).into()),
-                        ..Default::default()
-                    })
-                    .into(),
-            );
+            all_content.push(container(column![].height(Length::Fixed(Theme::SPACING_LG))).into());
         }
 
         let logs: Vec<Element<'_, Message>> = self
@@ -817,56 +850,72 @@ impl State {
 
         let clear_button = button(
             row![text("Очистить").size(12)]
-                .spacing(8)
+                .spacing(6)
                 .align_y(Alignment::Center),
         )
         .on_press(Message::ClearTerminal)
-        .padding([6, 12])
-        .style(
-            move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
-                background: Some(Color::from_rgb(0.6, 0.2, 0.2).into()),
+        .padding([8, 14])
+        .style(|_, _| button::Style {
+            background: Some(Theme::ERROR.into()),
+            text_color: Color::WHITE,
+            border: iced::border::Border {
+                radius: Theme::RADIUS_SM.into(),
                 ..Default::default()
             },
-        );
+            ..Default::default()
+        });
 
         let check_changes_button = button(
-            row![text("Проверить изменения").size(12)]
-                .spacing(8)
+            row![text("Проверить").size(12)]
+                .spacing(6)
                 .align_y(Alignment::Center),
         )
         .on_press(Message::FileChangesChecked)
-        .padding([6, 12])
-        .style(
-            move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
-                background: Some(Color::from_rgb(0.2, 0.6, 0.8).into()),
+        .padding([8, 14])
+        .style(|_, _| button::Style {
+            background: Some(Theme::INFO.into()),
+            text_color: Color::WHITE,
+            border: iced::border::Border {
+                radius: Theme::RADIUS_SM.into(),
                 ..Default::default()
             },
-        );
+            ..Default::default()
+        });
 
         let sync_button = button(
             row![text("Синхронизировать").size(12)]
-                .spacing(8)
+                .spacing(6)
                 .align_y(Alignment::Center),
         )
         .on_press(Message::SyncAllFiles)
-        .padding([6, 12])
-        .style(
-            move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
-                background: Some(Color::from_rgb(0.2, 0.8, 0.3).into()),
+        .padding([8, 14])
+        .style(|_, _| button::Style {
+            background: Some(Theme::SUCCESS.into()),
+            text_color: Color::WHITE,
+            border: iced::border::Border {
+                radius: Theme::RADIUS_SM.into(),
                 ..Default::default()
             },
-        );
+            ..Default::default()
+        });
 
-        let header = row![clear_button, check_changes_button, sync_button].spacing(10);
+        let header =
+            row![clear_button, check_changes_button, sync_button].spacing(Theme::SPACING_SM);
 
         let terminal_content = if all_content.is_empty() && logs.is_empty() {
             column![
-                text("Нет логов")
-                    .color(Color::from_rgb(0.5, 0.5, 0.5))
-                    .size(14)
+                container(
+                    column![
+                        text("📋").size(40),
+                        text("Нет логов").size(14).color(Theme::TEXT_MUTED),
+                    ]
+                    .spacing(Theme::SPACING_SM)
+                    .align_x(Alignment::Center),
+                )
+                .center_x(Length::Fill)
+                .center_y(Length::Fixed(150.0))
             ]
             .align_x(Alignment::Center)
-            .padding(20)
         } else {
             let mut content = all_content;
             content.extend(logs);
@@ -878,18 +927,18 @@ impl State {
                 .width(Length::Fill)
                 .height(Length::Fill),
         )
-        .padding(10)
-        .style(move |_| container::Style {
-            background: Some(Color::from_rgb(0.08, 0.08, 0.08).into()),
+        .padding(Theme::SPACING_MD)
+        .style(|_| container::Style {
+            background: Some(Theme::BACKGROUND_SECONDARY.into()),
             border: iced::border::Border {
-                radius: 5.0.into(),
+                radius: Theme::RADIUS_MD.into(),
                 ..Default::default()
             },
             ..Default::default()
         });
 
         column![header, scrollable_terminal]
-            .spacing(10)
+            .spacing(Theme::SPACING_MD)
             .height(Length::Fill)
             .into()
     }
@@ -901,10 +950,38 @@ impl State {
                 .align_y(Alignment::Center),
         )
         .on_press(Message::FilesFetch)
-        .padding([8, 16]);
+        .padding([10, 18])
+        .style(|_, _| button::Style {
+            background: Some(Theme::BACKGROUND_TERTIARY.into()),
+            text_color: Theme::TEXT_PRIMARY,
+            border: iced::border::Border {
+                radius: Theme::RADIUS_SM.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
 
-        let file_size: f32 = 100.0;
-        let file_height: f32 = 140.0;
+        let upload_button = button(
+            row![text("Загрузить").size(14),]
+                .spacing(8)
+                .align_y(Alignment::Center),
+        )
+        .on_press(Message::UploadFile)
+        .padding([10, 18])
+        .style(|_, _| button::Style {
+            background: Some(Theme::SUCCESS.into()),
+            text_color: Color::WHITE,
+            border: iced::border::Border {
+                radius: Theme::RADIUS_SM.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let header_row = row![refresh_button, upload_button].spacing(Theme::SPACING_MD);
+
+        let file_card_width: f32 = 130.0;
+        let file_card_height: f32 = 150.0;
         let columns: usize = 5;
 
         let files_rows: Vec<Element<'_, Message>> = self
@@ -914,35 +991,61 @@ impl State {
                 let file_buttons: Vec<Element<'_, Message>> = chunk
                     .iter()
                     .map(|file_info| {
-                        let author_text = format!("[{}]", file_info.author.login);
+                        let author_text = format!("@{}", file_info.author.login);
+                        let size_text = if file_info.size < 1024 {
+                            format!("{} B", file_info.size)
+                        } else if file_info.size < 1024 * 1024 {
+                            format!("{:.1} KB", file_info.size as f32 / 1024.0)
+                        } else {
+                            format!("{:.1} MB", file_info.size as f32 / (1024.0 * 1024.0))
+                        };
 
                         let content = column![
-                            text("🗎").size(44),
+                            container(text("📄").size(40))
+                                .width(Length::Fill)
+                                .center_x(Length::Fill)
+                                .padding(8)
+                                .style(|_| container::Style {
+                                    background: Some(Theme::BACKGROUND_TERTIARY.into()),
+                                    border: iced::border::Border {
+                                        radius: Theme::RADIUS_SM.into(),
+                                        ..Default::default()
+                                    },
+                                    ..Default::default()
+                                }),
                             container(
                                 text(&file_info.name)
-                                    .size(11)
+                                    .size(12)
+                                    .color(Theme::TEXT_PRIMARY)
                                     .shaping(text::Shaping::Advanced)
                             )
-                            .width(Length::Fixed(file_size))
-                            .height(Length::Fixed(20.0))
+                            .width(Length::Fixed(file_card_width - 20.0))
+                            .height(Length::Fixed(32.0))
                             .align_x(iced::alignment::Horizontal::Center)
-                            .center_y(Length::Fixed(20.0))
-                            .clip(true),
-                            text(author_text).size(9),
-                            text(format!("{} KB", file_info.size / 1024)).size(9),
+                            .center_y(Length::Fixed(32.0)),
+                            text(author_text).size(10).color(Theme::TEXT_MUTED),
+                            text(size_text).size(10).color(Theme::TEXT_SECONDARY),
                         ]
-                        .spacing(4)
+                        .spacing(Theme::SPACING_SM)
                         .align_x(Alignment::Center);
 
                         let btn = button(content)
                             .on_press(Message::FileClicked(file_info.clone()))
-                            .width(Length::Fixed(file_size))
-                            .height(Length::Fixed(file_height))
-                            .padding(10);
+                            .width(Length::Fixed(file_card_width))
+                            .height(Length::Fixed(file_card_height))
+                            .padding(12)
+                            .style(|_, _| button::Style {
+                                background: Some(Theme::CARD_BACKGROUND.into()),
+                                border: iced::border::Border {
+                                    radius: Theme::RADIUS_MD.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            });
 
                         tooltip(
                             btn,
-                            text(&file_info.name).size(14),
+                            text(&file_info.name).size(13),
                             tooltip::Position::FollowCursor,
                         )
                         .into()
@@ -951,52 +1054,100 @@ impl State {
 
                 let mut row_widgets: Vec<Element<'_, Message>> = file_buttons;
                 while row_widgets.len() < columns {
-                    row_widgets.push(container("").width(Length::Fixed(file_size)).into());
+                    row_widgets.push(container("").width(Length::Fixed(file_card_width)).into());
                 }
-                row(row_widgets).spacing(10).into()
+                row(row_widgets).spacing(Theme::SPACING_MD).into()
             })
             .collect();
 
-        let upload_button = button(
-            row![text("Загрузить").size(14)]
-                .spacing(8)
-                .align_y(Alignment::Center),
-        )
-        .on_press(Message::UploadFile)
-        .padding([8, 16])
-        .style(
-            move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
-                background: Some(Color::from_rgb(0.2, 0.6, 0.3).into()),
-                ..Default::default()
-            },
-        );
-
-        let header_row = row![refresh_button, upload_button].spacing(10);
-
         let content = if self.files_loading {
-            column![text("Загрузка списка...").size(16)].align_x(Alignment::Center)
+            column![
+                container(
+                    column![
+                        text("Загрузка файлов...")
+                            .size(16)
+                            .color(Theme::TEXT_SECONDARY),
+                    ]
+                    .spacing(Theme::SPACING_MD)
+                    .align_x(Alignment::Center),
+                )
+                .center_x(Length::Fill)
+                .center_y(Length::Fixed(200.0))
+            ]
+            .align_x(Alignment::Center)
         } else if self.upload_loading {
-            column![text("Загрузка файла...").size(16),].align_x(Alignment::Center)
+            column![
+                container(
+                    column![
+                        text("Загрузка файла...")
+                            .size(16)
+                            .color(Theme::TEXT_SECONDARY),
+                    ]
+                    .spacing(Theme::SPACING_MD)
+                    .align_x(Alignment::Center),
+                )
+                .center_x(Length::Fill)
+                .center_y(Length::Fixed(200.0))
+            ]
+            .align_x(Alignment::Center)
         } else {
             let mut content_col: Vec<Element<'_, Message>> = vec![header_row.into()];
 
             if let Some(e) = &self.upload_error {
                 content_col.push(
-                    container(text(e).color(Color::from_rgb(1.0, 0.3, 0.3)))
-                        .padding(5)
+                    container(
+                        row![text(e).size(13).color(Color::WHITE),]
+                            .spacing(Theme::SPACING_SM)
+                            .align_y(Alignment::Center),
+                    )
+                    .padding([10, 16])
+                    .width(Length::Fill)
+                    .style(|_| container::Style {
+                        background: Some(Color::from_rgb(0.45, 0.15, 0.15).into()),
+                        border: iced::border::Border {
+                            radius: Theme::RADIUS_SM.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                    .into(),
+                );
+            }
+
+            if self.files.is_empty() {
+                content_col.push(
+                    container(
+                        column![
+                            text("📂").size(48),
+                            text("Нет файлов").size(16).color(Theme::TEXT_SECONDARY),
+                            text("Загрузите первый файл")
+                                .size(13)
+                                .color(Theme::TEXT_MUTED),
+                        ]
+                        .spacing(Theme::SPACING_SM)
+                        .align_x(Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .center_x(Length::Fill)
+                    .padding(Theme::SPACING_XL)
+                    .into(),
+                );
+            } else {
+                content_col.push(
+                    column(files_rows)
+                        .spacing(Theme::SPACING_MD)
+                        .padding(Theme::SPACING_SM)
                         .into(),
                 );
             }
 
-            content_col.push(column(files_rows).spacing(10).padding(10).into());
-
-            column(content_col).spacing(10)
+            column(content_col).spacing(Theme::SPACING_MD)
         };
 
         container(content)
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding(20)
+            .padding(Theme::SPACING_MD)
             .into()
     }
 
@@ -1005,117 +1156,205 @@ impl State {
             let main_content = self.create_main_window();
             let terminal_content = self.create_terminal_tab();
 
-            let tab_button_style = |active: bool| -> container::Style {
-                if active {
-                    container::Style {
-                        background: Some(Color::from_rgb(0.2, 0.6, 0.3).into()),
-                        text_color: Some(Color::WHITE),
+            let tab_style =
+                move |active: bool, status: iced::widget::button::Status| -> button::Style {
+                    let bg = if active {
+                        Theme::PRIMARY
+                    } else {
+                        match status {
+                            iced::widget::button::Status::Hovered => Theme::BACKGROUND_TERTIARY,
+                            _ => Theme::BACKGROUND_SECONDARY,
+                        }
+                    };
+                    button::Style {
+                        background: Some(bg.into()),
+                        text_color: Color::WHITE,
                         border: iced::border::Border {
-                            radius: 10.0.into(),
+                            radius: Theme::RADIUS_SM.into(),
                             ..Default::default()
                         },
                         ..Default::default()
                     }
-                } else {
-                    container::Style {
-                        background: Some(Color::from_rgb(0.15, 0.15, 0.15).into()),
-                        text_color: Some(Color::WHITE),
-                        border: iced::border::Border {
-                            radius: 10.0.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }
-                }
-            };
+                };
 
-            let tab1 = button(
-                container(text("Главная").size(14))
-                    .padding([10, 20])
-                    .style(move |_| tab_button_style(self.active_tab == 0)),
-            )
-            .on_press(Message::TabChanged(0));
+            let tab1 = button(text("Главная").size(14))
+                .on_press(Message::TabChanged(0))
+                .padding([10, 20])
+                .style(move |_, status| tab_style(self.active_tab == 0, status));
 
-            let tab2 = button(
-                container(text("Терминал").size(14))
-                    .padding([10, 20])
-                    .style(move |_| tab_button_style(self.active_tab == 1)),
-            )
-            .on_press(Message::TabChanged(1));
+            let tab2 = button(text("Терминал").size(14))
+                .on_press(Message::TabChanged(1))
+                .padding([10, 20])
+                .style(move |_, status| tab_style(self.active_tab == 1, status));
 
-            let tab_bar = row![tab1, tab2].spacing(5);
+            let tab_bar = row![tab1, tab2].spacing(Theme::SPACING_SM);
 
-            let user_info = self
-                .current_user
-                .as_ref()
-                .map(|user| text(format!("{} ({})", user.username, user.login)).size(14));
+            let user_info = self.current_user.as_ref().map(|user| {
+                let role_badge = user
+                    .role
+                    .as_ref()
+                    .map(|r| r.name.clone())
+                    .unwrap_or_default();
+                row![
+                    text("👤").size(16),
+                    column![
+                        text(&user.username).size(14).color(Color::WHITE),
+                        text(role_badge).size(10).color(Theme::TEXT_MUTED),
+                    ]
+                    .spacing(2)
+                ]
+                .spacing(Theme::SPACING_SM)
+                .align_y(Alignment::Center)
+            });
 
             let logout_button = button(
-                row![text("Выйти").size(14)]
+                row![text("Выйти").size(13)]
                     .spacing(8)
                     .align_y(Alignment::Center),
             )
             .on_press(Message::Logout)
             .padding([8, 16])
-            .style(
-                move |_: &_, _: iced::widget::button::Status| iced::widget::button::Style {
-                    background: Some(Color::from_rgb(0.8, 0.2, 0.2).into()),
+            .style(|_, _| button::Style {
+                background: Some(Theme::ERROR.into()),
+                text_color: Color::WHITE,
+                border: iced::border::Border {
+                    radius: Theme::RADIUS_SM.into(),
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            });
 
-            let header_row = row![user_info, logout_button].spacing(10);
+            let header_row = row![user_info, logout_button].spacing(Theme::SPACING_MD);
 
             let content = match self.active_tab {
                 0 => main_content,
                 _ => terminal_content,
             };
 
-            return column![header_row, tab_bar, content].spacing(10).into();
+            return column![header_row, tab_bar, content]
+                .spacing(Theme::SPACING_MD)
+                .into();
         }
 
         let error_message = self.auth_state.error.as_ref().map(|error| {
-            container(text(error).color(Color::WHITE))
-                .padding([5, 10])
-                .style(|_| container::Style {
-                    background: Some(Color::from_rgb(0.8, 0.2, 0.2).into()),
+            container(
+                row![text(error).size(13).color(Color::WHITE),]
+                    .spacing(Theme::SPACING_SM)
+                    .align_y(Alignment::Center),
+            )
+            .padding([10, 16])
+            .width(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(Color::from_rgb(0.45, 0.15, 0.15).into()),
+                border: iced::border::Border {
+                    radius: Theme::RADIUS_SM.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        });
+
+        let login_input = text_input("Логин", &self.auth_state.login)
+            .on_input(Message::LoginChanged)
+            .padding([12, 16])
+            .size(15)
+            .style(move |_: &_, _: iced::widget::text_input::Status| {
+                iced::widget::text_input::Style {
+                    background: Theme::BACKGROUND_TERTIARY.into(),
                     border: iced::border::Border {
-                        radius: 5.0.into(),
+                        radius: Theme::RADIUS_SM.into(),
                         ..Default::default()
                     },
-                    ..Default::default()
-                })
+                    icon: Theme::TEXT_MUTED,
+                    placeholder: Theme::TEXT_MUTED,
+                    value: Theme::TEXT_PRIMARY,
+                    selection: Theme::PRIMARY,
+                }
+            });
+
+        let password_input = text_input("Пароль", &self.auth_state.password)
+            .on_input(Message::PasswordChanged)
+            .secure(true)
+            .padding([12, 16])
+            .size(15)
+            .style(move |_: &_, _: iced::widget::text_input::Status| {
+                iced::widget::text_input::Style {
+                    background: Theme::BACKGROUND_TERTIARY.into(),
+                    border: iced::border::Border {
+                        radius: Theme::RADIUS_SM.into(),
+                        ..Default::default()
+                    },
+                    icon: Theme::TEXT_MUTED,
+                    placeholder: Theme::TEXT_MUTED,
+                    value: Theme::TEXT_PRIMARY,
+                    selection: Theme::PRIMARY,
+                }
+            });
+
+        let login_button = button(
+            row![text("Войти").size(15)]
+                .spacing(8)
+                .align_y(Alignment::Center),
+        )
+        .on_press(Message::AuthSubmit)
+        .padding([12, 32])
+        .width(Length::Fill)
+        .style(|_, _| button::Style {
+            background: Some(Theme::PRIMARY.into()),
+            text_color: Color::WHITE,
+            border: iced::border::Border {
+                radius: Theme::RADIUS_SM.into(),
+                ..Default::default()
+            },
+            ..Default::default()
         });
 
         let auth_form = column![
-            text("Авторизация").size(24),
-            text_input("Логин", &self.auth_state.login).on_input(Message::LoginChanged),
-            text_input("Пароль", &self.auth_state.password)
-                .on_input(Message::PasswordChanged)
-                .secure(true),
-            button("Войти").on_press(Message::AuthSubmit),
+            column![
+                text("D-DOX").size(32).color(Theme::PRIMARY),
+                text("Document Management")
+                    .size(14)
+                    .color(Theme::TEXT_MUTED),
+            ]
+            .spacing(4)
+            .align_x(Alignment::Center),
+            container(column![].height(Length::Fixed(24.0))),
+            login_input,
+            password_input,
+            login_button,
             error_message,
         ]
-        .spacing(10)
+        .spacing(Theme::SPACING_MD)
         .align_x(Alignment::Center);
 
-        container(
-            container(auth_form)
-                .padding(20)
-                .width(Length::Fixed(300.0))
-                .style(|_| container::Style {
-                    background: Some(Color::from_rgb(0.15, 0.15, 0.15).into()),
-                    border: iced::border::Border {
-                        radius: 10.0.into(),
-                        ..Default::default()
-                    },
+        let card = container(auth_form)
+            .padding(Theme::SPACING_XL)
+            .width(Length::Fixed(380.0))
+            .style(|_| container::Style {
+                background: Some(Theme::CARD_BACKGROUND.into()),
+                border: iced::border::Border {
+                    radius: Theme::RADIUS_MD.into(),
                     ..Default::default()
-                }),
+                },
+                ..Default::default()
+            });
+
+        container(
+            column![
+                container(text("📁").size(64)).center_x(Length::Fixed(100.0)),
+                card,
+            ]
+            .spacing(Theme::SPACING_LG)
+            .align_x(Alignment::Center),
         )
         .width(Length::Fill)
         .height(Length::Fill)
         .center_x(Length::Fill)
         .center_y(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(Theme::BACKGROUND_PRIMARY.into()),
+            ..Default::default()
+        })
         .into()
     }
 }
