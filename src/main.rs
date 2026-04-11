@@ -583,6 +583,160 @@ impl State {
                 );
                 Task::none()
             }
+            Message::FetchFileVersions(file_name) => {
+                let client = Client::new();
+                let auth_header = self.get_auth_header();
+
+                let file_id = self
+                    .tracked_files
+                    .get(&file_name)
+                    .map(|t| t.file_id)
+                    .unwrap_or(0);
+
+                return Task::perform(
+                    async move {
+                        let url = format!("{BASE_URL}/files/{}/versions", file_id);
+                        let mut req = client.get(&url);
+                        if let Some(token) = auth_header {
+                            req = req.header("Authorization", token);
+                        }
+                        match req.send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                match resp.json::<Vec<FileVersionInfo>>().await {
+                                    Ok(versions) => Ok(versions),
+                                    Err(e) => Err(format!("JSON error: {e}")),
+                                }
+                            }
+                            Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    },
+                    move |result| Message::FileVersionsReceived(file_name.clone(), result),
+                );
+            }
+            Message::FileVersionsReceived(file_name, result) => {
+                let file_name_for_log = file_name.clone();
+                match result {
+                    Ok(versions) => {
+                        let count = versions.len();
+                        self.version_history.insert(file_name.clone(), versions);
+                        self.selected_file_for_versions = Some(file_name);
+                        self.add_log(
+                            format!("Loaded {} version(s) for '{}'", count, file_name_for_log),
+                            LogType::Info,
+                        );
+                    }
+                    Err(e) => {
+                        self.add_log(
+                            format!("Failed to load versions for '{}': {}", file_name_for_log, e),
+                            LogType::Error,
+                        );
+                    }
+                }
+                Task::none()
+            }
+            Message::DownloadFileVersion(file_name, version) => {
+                let client = Client::new();
+                let auth_header = self.get_auth_header();
+                let folder = self.download_folder.clone();
+                let file_name_for_async = file_name.clone();
+
+                return Task::perform(
+                    async move {
+                        let url = format!(
+                            "{BASE_URL}/files/{}/versions/{}",
+                            file_name_for_async, version
+                        );
+                        let mut req = client.get(&url);
+                        if let Some(token) = auth_header {
+                            req = req.header("Authorization", token);
+                        }
+                        match req.send().await {
+                            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                                Ok(bytes) => {
+                                    if let Some(ref folder) = folder {
+                                        let _ = std::fs::create_dir_all(folder);
+                                        let file_path = folder.join(format!(
+                                            "{}_v{}",
+                                            file_name_for_async
+                                                .trim_end_matches(|c: char| !c.is_alphanumeric()),
+                                            version
+                                        ));
+                                        let _ = std::fs::write(&file_path, &bytes);
+                                        Ok(file_path)
+                                    } else {
+                                        Err("No download folder".to_string())
+                                    }
+                                }
+                                Err(e) => Err(format!("Read error: {e}")),
+                            },
+                            Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    },
+                    Message::FileVersionDownloaded,
+                );
+            }
+            Message::FileVersionDownloaded(result) => {
+                match result {
+                    Ok(file_path) => {
+                        self.add_log(
+                            format!(
+                                "Downloaded version: {}",
+                                file_path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default()
+                            ),
+                            LogType::GitAdded,
+                        );
+                        let _ = open::that(&file_path);
+                    }
+                    Err(e) => {
+                        self.add_log(format!("Version download failed: {}", e), LogType::Error);
+                    }
+                }
+                Task::none()
+            }
+            Message::CloseVersionHistory => {
+                self.selected_file_for_versions = None;
+                Task::none()
+            }
+            Message::DeleteFile(file_name) => {
+                let client = Client::new();
+                let auth_header = self.get_auth_header();
+
+                return Task::perform(
+                    async move {
+                        let url = format!("{BASE_URL}/files/{}", file_name);
+                        let mut req = client.delete(&url);
+                        if let Some(token) = auth_header {
+                            req = req.header("Authorization", token);
+                        }
+                        match req.send().await {
+                            Ok(resp) if resp.status().is_success() => Ok(file_name),
+                            Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    },
+                    Message::FileDeleted,
+                );
+            }
+            Message::FileDeleted(result) => {
+                match result {
+                    Ok(file_name) => {
+                        self.files.retain(|f| f.name != file_name);
+                        self.tracked_files.remove(&file_name);
+                        self.modified_files.remove(&file_name);
+                        self.version_history.remove(&file_name);
+                        self.add_log(format!("Deleted: {}", file_name), LogType::GitRemoved);
+                    }
+                    Err(e) => {
+                        self.add_log(format!("Delete failed: {}", e), LogType::Error);
+                    }
+                }
+                Task::none()
+            }
         }
     }
 
@@ -982,8 +1136,8 @@ impl State {
 
         let header_row = row![refresh_button, upload_button].spacing(Theme::SPACING_MD);
 
-        let file_card_width: f32 = 130.0;
-        let file_card_height: f32 = 150.0;
+        let file_card_width: f32 = 140.0;
+        let file_card_height: f32 = 180.0;
         let columns: usize = 5;
 
         let files_rows: Vec<Element<'_, Message>> = self
@@ -1002,19 +1156,72 @@ impl State {
                             format!("{:.1} MB", file_info.size as f32 / (1024.0 * 1024.0))
                         };
 
-                        let content = column![
-                            container(text("📄").size(40))
-                                .width(Length::Fill)
-                                .center_x(Length::Fill)
-                                .padding(8)
-                                .style(|_| container::Style {
-                                    background: Some(Theme::BACKGROUND_TERTIARY.into()),
-                                    border: iced::border::Border {
-                                        radius: Theme::RADIUS_SM.into(),
-                                        ..Default::default()
-                                    },
+                        let is_modified = self.modified_files.contains(&file_info.name);
+                        let version_badge = text(format!("v{}", file_info.version))
+                            .size(10)
+                            .color(Color::WHITE);
+
+                        let version_badge_container = container(version_badge)
+                            .padding([2, 6])
+                            .style(move |_| container::Style {
+                                background: Some(
+                                    if is_modified {
+                                        Theme::WARNING
+                                    } else {
+                                        Theme::INFO
+                                    }
+                                    .into(),
+                                ),
+                                border: iced::border::Border {
+                                    radius: Theme::RADIUS_SM.into(),
                                     ..Default::default()
-                                }),
+                                },
+                                ..Default::default()
+                            });
+
+                        let versions_button = button(text("🕒").size(12))
+                            .on_press(Message::FetchFileVersions(file_info.name.clone()))
+                            .padding([4, 8])
+                            .style(|_, _| button::Style {
+                                background: Some(Theme::BACKGROUND_TERTIARY.into()),
+                                text_color: Theme::TEXT_PRIMARY,
+                                border: iced::border::Border {
+                                    radius: Theme::RADIUS_SM.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            });
+
+                        let delete_button = button(text("🗑").size(12))
+                            .on_press(Message::DeleteFile(file_info.name.clone()))
+                            .padding([4, 8])
+                            .style(|_, _| button::Style {
+                                background: Some(Theme::ERROR.into()),
+                                text_color: Color::WHITE,
+                                border: iced::border::Border {
+                                    radius: Theme::RADIUS_SM.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            });
+
+                        let content = column![
+                            row![
+                                container(text("📄").size(40))
+                                    .width(Length::Fill)
+                                    .center_x(Length::Fill)
+                                    .padding(8)
+                                    .style(|_| container::Style {
+                                        background: Some(Theme::BACKGROUND_TERTIARY.into()),
+                                        border: iced::border::Border {
+                                            radius: Theme::RADIUS_SM.into(),
+                                            ..Default::default()
+                                        },
+                                        ..Default::default()
+                                    }),
+                                version_badge_container
+                            ]
+                            .spacing(4),
                             container(
                                 text(&file_info.name)
                                     .size(12)
@@ -1026,7 +1233,14 @@ impl State {
                             .align_x(iced::alignment::Horizontal::Center)
                             .center_y(Length::Fixed(32.0)),
                             text(author_text).size(10).color(Theme::TEXT_MUTED),
-                            text(size_text).size(10).color(Theme::TEXT_SECONDARY),
+                            row![
+                                text(size_text).size(10).color(Theme::TEXT_SECONDARY),
+                                versions_button,
+                                delete_button
+                            ]
+                            .spacing(4)
+                            .align_y(Alignment::End)
+                            .width(Length::Fill),
                         ]
                         .spacing(Theme::SPACING_SM)
                         .align_x(Alignment::Center);
@@ -1146,11 +1360,137 @@ impl State {
             column(content_col).spacing(Theme::SPACING_MD)
         };
 
-        container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(Theme::SPACING_MD)
-            .into()
+        let final_content: Element<'_, Message> =
+            if let Some(ref selected_file) = self.selected_file_for_versions {
+                if let Some(versions) = self.version_history.get(selected_file) {
+                    let close_button = button(text("X").size(14))
+                        .on_press(Message::CloseVersionHistory)
+                        .padding([4, 8])
+                        .style(|_, _| button::Style {
+                            background: Some(Theme::ERROR.into()),
+                            text_color: Color::WHITE,
+                            border: iced::border::Border {
+                                radius: Theme::RADIUS_SM.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        });
+
+                    let versions_list: Vec<Element<'_, Message>> = versions
+                        .iter()
+                        .map(|v| {
+                            let date_str = if v.created_at.len() > 10 {
+                                &v.created_at[..10]
+                            } else {
+                                &v.created_at
+                            };
+                            let author_text = format!("@{}", v.author.login);
+                            let size_str = if v.size < 1024 {
+                                format!("{} B", v.size)
+                            } else if v.size < 1024 * 1024 {
+                                format!("{:.1} KB", v.size as f32 / 1024.0)
+                            } else {
+                                format!("{:.1} MB", v.size as f32 / (1024.0 * 1024.0))
+                            };
+
+                            let download_btn = button(text("⬇").size(12))
+                                .on_press(Message::DownloadFileVersion(
+                                    selected_file.clone(),
+                                    v.version,
+                                ))
+                                .padding([4, 8])
+                                .style(|_, _| button::Style {
+                                    background: Some(Theme::SUCCESS.into()),
+                                    text_color: Color::WHITE,
+                                    border: iced::border::Border {
+                                        radius: Theme::RADIUS_SM.into(),
+                                        ..Default::default()
+                                    },
+                                    ..Default::default()
+                                });
+
+                            container(
+                                row![
+                                    text(format!("v{}", v.version))
+                                        .size(14)
+                                        .width(Length::Fixed(40.0)),
+                                    text(author_text)
+                                        .size(11)
+                                        .width(Length::Fixed(100.0))
+                                        .color(Theme::TEXT_MUTED),
+                                    text(size_str)
+                                        .size(11)
+                                        .width(Length::Fixed(70.0))
+                                        .color(Theme::TEXT_SECONDARY),
+                                    text(date_str)
+                                        .size(11)
+                                        .width(Length::Fixed(90.0))
+                                        .color(Theme::TEXT_MUTED),
+                                    download_btn
+                                ]
+                                .spacing(Theme::SPACING_SM)
+                                .align_y(Alignment::Center),
+                            )
+                            .padding([8, 12])
+                            .style(|_| container::Style {
+                                background: Some(Theme::BACKGROUND_TERTIARY.into()),
+                                border: iced::border::Border {
+                                    radius: Theme::RADIUS_SM.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            })
+                            .into()
+                        })
+                        .collect();
+
+                    let versions_panel = container(
+                        column![
+                            row![
+                                text(format!("Версии: {}", selected_file))
+                                    .size(14)
+                                    .color(Color::WHITE),
+                                close_button
+                            ]
+                            .spacing(Theme::SPACING_SM)
+                            .align_y(Alignment::Center),
+                            scrollable(column(versions_list).spacing(Theme::SPACING_SM))
+                                .height(Length::Fixed(300.0))
+                        ]
+                        .spacing(Theme::SPACING_SM),
+                    )
+                    .padding(Theme::SPACING_MD)
+                    .width(Length::Fill)
+                    .style(|_| container::Style {
+                        background: Some(Theme::CARD_BACKGROUND.into()),
+                        border: iced::border::Border {
+                            color: Theme::PRIMARY,
+                            width: 2.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    });
+
+                    column![
+                        container(content).width(Length::Fill).height(Length::Fill),
+                        versions_panel
+                    ]
+                    .spacing(Theme::SPACING_MD)
+                    .into()
+                } else {
+                    container(content)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                }
+            } else {
+                container(content)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            };
+
+        final_content
     }
 
     fn view(&self) -> Element<'_, Message> {

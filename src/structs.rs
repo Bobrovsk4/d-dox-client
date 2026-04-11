@@ -40,6 +40,7 @@ pub enum LogType {
     GitBranch,
     GitAdded,
     GitModified,
+    GitRemoved,
     DiffHeader,
     DiffAdded,
     DiffRemoved,
@@ -55,6 +56,7 @@ impl LogType {
             LogType::GitBranch => Theme::INFO,
             LogType::GitAdded => Theme::SUCCESS,
             LogType::GitModified => Theme::WARNING,
+            LogType::GitRemoved => Color::from_rgb(0.8, 0.2, 0.2),
             LogType::DiffHeader => Theme::INFO,
             LogType::DiffAdded => Theme::SUCCESS,
             LogType::DiffRemoved => Theme::ERROR,
@@ -94,6 +96,8 @@ pub struct State {
     pub terminal_logs: Vec<LogEntry>,
     pub tracked_files: HashMap<String, TrackedFile>,
     pub version_conflicts: HashMap<String, VersionConflict>,
+    pub version_history: HashMap<String, Vec<FileVersionInfo>>,
+    pub selected_file_for_versions: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -102,6 +106,15 @@ pub struct VersionConflict {
     pub file_name: String,
     pub local_content: String,
     pub server_version: i32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileVersionInfo {
+    pub id: i32,
+    pub version: i32,
+    pub size: i64,
+    pub author: AuthorInfo,
+    pub created_at: String,
 }
 
 pub struct AuthState {
@@ -198,4 +211,11 @@ pub enum Message {
     Logout,
     ResolveConflictKeepLocal(String),
     ResolveConflictKeepServer(String),
+    FetchFileVersions(String), // file_name
+    FileVersionsReceived(String, Result<Vec<FileVersionInfo>, String>),
+    DownloadFileVersion(String, i32), // file_name, version
+    FileVersionDownloaded(Result<std::path::PathBuf, String>),
+    CloseVersionHistory,
+    DeleteFile(String),
+    FileDeleted(Result<String, String>),
 }
