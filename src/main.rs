@@ -1,13 +1,18 @@
 mod structs;
+use crate::structs::*;
+use calamine::{Data, Reader, Xlsx};
 use iced::{
     Alignment, Color, Element, Length, Task,
     widget::{button, column, container, row, scrollable, text, text_input, tooltip},
 };
 use jsonwebtoken::{DecodingKey, Validation, decode};
 use reqwest::Client;
+use sha2::{Digest, Sha256};
+use similar::TextDiff;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use crate::structs::*;
 
 const BASE_URL: &str = "http://192.168.1.71:31356";
 
@@ -170,6 +175,8 @@ impl State {
                                 .or_insert_with(|| TrackedFile {
                                     _path: folder.join(&file.name),
                                     content: String::new(),
+                                    content_hash: None,
+                                    extracted_text: None,
                                     last_modified: 0,
                                     version: file.version,
                                     file_id: file.id,
@@ -481,10 +488,37 @@ impl State {
                         self.add_log(format!("Synced: {}", name), LogType::GitModified);
 
                         if let Some(ref folder) = self.download_folder {
-                            if let Ok(content) = std::fs::read_to_string(folder.join(&name)) {
-                                self.track_file(&name, content);
-                                if let Some(tracked) = self.tracked_files.get_mut(&name) {
-                                    tracked.version = new_version;
+                            let file_path = folder.join(&name);
+                            let kind = detect_file_kind(&file_path);
+                            match kind {
+                                FileKind::Text => {
+                                    if let Ok(content) = std::fs::read_to_string(&file_path) {
+                                        self.track_file(&name, content);
+                                        if let Some(tracked) = self.tracked_files.get_mut(&name) {
+                                            tracked.version = new_version;
+                                        }
+                                    }
+                                }
+                                FileKind::Docx | FileKind::Pdf | FileKind::Xlsx => {
+                                    if let Ok(extracted) = extract_text_from_file(&file_path, &kind)
+                                    {
+                                        if let Some(tracked) = self.tracked_files.get_mut(&name) {
+                                            tracked.extracted_text = Some(extracted);
+                                            tracked.version = new_version;
+                                            self.modified_files.remove(&name);
+                                        }
+                                    } else {
+                                        eprintln!(
+                                            "Не удалось обновить extracted_text для {} после синхронизации",
+                                            name
+                                        );
+                                    }
+                                }
+                                FileKind::Binary => {
+                                    if let Some(tracked) = self.tracked_files.get_mut(&name) {
+                                        tracked.version = new_version;
+                                        self.modified_files.remove(&name);
+                                    }
                                 }
                             }
                         }
@@ -498,6 +532,11 @@ impl State {
                         );
                     }
                     Err(e) => {
+                        eprintln!(
+                            "Sync error for {:?}: {}",
+                            files_to_sync.first().unwrap_or(&"?".to_string()),
+                            e
+                        );
                         let failed_file = files_to_sync.first().cloned().unwrap_or_default();
                         files_to_sync.remove(0);
                         if e.contains("Version conflict") && !failed_file.is_empty() {
@@ -656,12 +695,20 @@ impl State {
                                 Ok(bytes) => {
                                     if let Some(ref folder) = folder {
                                         let _ = std::fs::create_dir_all(folder);
-                                        let file_path = folder.join(format!(
-                                            "{}_v{}",
-                                            file_name_for_async
-                                                .trim_end_matches(|c: char| !c.is_alphanumeric()),
-                                            version
-                                        ));
+
+                                        let (stem, ext) =
+                                            if let Some(ext_pos) = file_name_for_async.rfind('.') {
+                                                (
+                                                    &file_name_for_async[..ext_pos],
+                                                    &file_name_for_async[ext_pos..],
+                                                )
+                                            } else {
+                                                (file_name_for_async.as_str(), "")
+                                            };
+                                        let versioned_name =
+                                            format!("{}_v{}{}", stem, version, ext);
+                                        let file_path = folder.join(versioned_name);
+
                                         let _ = std::fs::write(&file_path, &bytes);
                                         Ok(file_path)
                                     } else {
@@ -729,6 +776,9 @@ impl State {
                         self.tracked_files.remove(&file_name);
                         self.modified_files.remove(&file_name);
                         self.version_history.remove(&file_name);
+                        if let Some(ref folder) = self.download_folder {
+                            self.cleanup_local_versions(folder, &file_name);
+                        }
                         self.add_log(format!("Deleted: {}", file_name), LogType::GitRemoved);
                     }
                     Err(e) => {
@@ -737,30 +787,74 @@ impl State {
                 }
                 Task::none()
             }
+            Message::RevertToVersion(file_name, target_version) => {
+                let client = Client::new();
+                let auth_header = self.get_auth_header();
+                let file_id = self
+                    .tracked_files
+                    .get(&file_name)
+                    .map(|t| t.file_id)
+                    .unwrap_or(0);
+                let file_name_clone = file_name.clone();
+
+                Task::perform(
+                    async move {
+                        let url = format!("{BASE_URL}/files/{}/revert", file_id);
+                        let mut req = client
+                            .post(&url)
+                            .json(&serde_json::json!({ "version": target_version }));
+                        if let Some(token) = auth_header {
+                            req = req.header("Authorization", token);
+                        }
+
+                        match req.send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                Ok((file_name_clone, target_version))
+                            }
+                            Ok(resp) => {
+                                let status = resp.status();
+                                let body = resp.text().await.unwrap_or_default();
+                                Err(format!("Revert failed (HTTP {}): {}", status, body))
+                            }
+                            Err(e) => Err(format!("Connection error: {}", e)),
+                        }
+                    },
+                    Message::RevertResult,
+                )
+            }
+            Message::RevertResult(result) => {
+                match result {
+                    Ok((file_name, new_version)) => {
+                        self.add_log(
+                            format!("Reverted '{}' to version {}", file_name, new_version),
+                            LogType::Success,
+                        );
+                        if let Some(ref folder) = self.download_folder {
+                            self.cleanup_local_versions(folder, &file_name);
+                            self.tracked_files.remove(&file_name);
+                            self.modified_files.remove(&file_name);
+                        }
+                        return Task::perform(async { Message::FilesFetch }, |m| m);
+                    }
+                    Err(e) => {
+                        self.add_log(e, LogType::Error);
+                    }
+                }
+                Task::none()
+            }
+            Message::ShowDiff(old_content, new_content) => {
+                show_diff_window(old_content, new_content);
+                Task::none()
+            }
         }
     }
 
     fn check_and_sync_files(&mut self) -> Task<Message> {
-        if let Some(ref folder) = self.download_folder {
-            for (file_name, tracked) in &mut self.tracked_files {
-                let file_path = folder.join(file_name);
-                if file_path.exists() {
-                    if let Ok(new_content) = std::fs::read_to_string(&file_path) {
-                        if new_content != tracked.content {
-                            self.modified_files.insert(file_name.clone());
-                        }
-                    }
-                }
-            }
-        }
-
         let files_to_sync: Vec<String> = self.modified_files.iter().cloned().collect();
-
         if files_to_sync.is_empty() {
             self.add_log("No files to sync".to_string(), LogType::Info);
             return Task::none();
         }
-
         self.add_log(
             format!("Found {} file(s) to sync", files_to_sync.len()),
             LogType::GitBranch,
@@ -804,6 +898,8 @@ impl State {
                 TrackedFile {
                     _path: path,
                     content,
+                    content_hash: None,
+                    extracted_text: None,
                     last_modified: now,
                     version,
                     file_id,
@@ -814,92 +910,158 @@ impl State {
 
     fn check_file_changes(&mut self) -> Task<Message> {
         if let Some(ref folder) = self.download_folder {
-            let mut changes_to_log: Vec<(String, String, String)> = Vec::new();
+            let mut changes_to_log = Vec::new();
 
             for (file_name, tracked) in &mut self.tracked_files {
                 let file_path = folder.join(file_name);
-                if file_path.exists() {
-                    if let Ok(new_content) = std::fs::read_to_string(&file_path) {
-                        if new_content != tracked.content {
-                            changes_to_log.push((
-                                file_name.clone(),
-                                tracked.content.clone(),
-                                new_content.clone(),
-                            ));
-                            tracked.content = new_content;
-                            let now = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs();
-                            tracked.last_modified = now;
-                            self.modified_files.insert(file_name.clone());
+                if !file_path.exists() {
+                    continue;
+                }
+
+                let kind = detect_file_kind(&file_path);
+                let changed = match kind {
+                    FileKind::Text => {
+                        if let Ok(new_content) = std::fs::read_to_string(&file_path) {
+                            if new_content != tracked.content {
+                                changes_to_log.push((
+                                    file_name.clone(),
+                                    tracked.content.clone(),
+                                    new_content.clone(),
+                                ));
+                                tracked.content = new_content;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
                         }
                     }
+                    FileKind::Docx | FileKind::Pdf | FileKind::Xlsx => {
+                        match extract_text_from_file(&file_path, &kind) {
+                            Ok(extracted) => {
+                                let old = tracked.extracted_text.as_deref().unwrap_or("");
+                                if extracted != old {
+                                    changes_to_log.push((
+                                        file_name.clone(),
+                                        old.to_string(),
+                                        extracted.clone(),
+                                    ));
+                                    tracked.extracted_text = Some(extracted);
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Ошибка извлечения текста из {}: {}", file_name, e);
+                                false
+                            }
+                        }
+                    }
+                    FileKind::Binary => match compute_hash(&file_path) {
+                        Ok(hash) => {
+                            let old = tracked.content_hash.as_deref().unwrap_or("");
+                            if hash != old {
+                                changes_to_log.push((
+                                    file_name.clone(),
+                                    format!("Binary changed (old hash: {})", old),
+                                    format!("Binary changed (new hash: {})", hash),
+                                ));
+                                tracked.content_hash = Some(hash);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Hash error: {e}");
+                            false
+                        }
+                    },
+                };
+
+                if changed {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    tracked.last_modified = now;
+                    self.modified_files.insert(file_name.clone());
                 }
             }
 
             if changes_to_log.is_empty() {
                 self.add_log("No changes spotted".to_string(), LogType::Info);
-                return Task::none();
+            } else {
+                for (file_name, old_content, new_content) in &changes_to_log {
+                    if old_content.starts_with("Binary changed") {
+                        self.add_log(format!("{}: {}", file_name, new_content), LogType::Warning);
+                    } else {
+                        self.show_diff(file_name, old_content, new_content);
+                    }
+                }
+                self.add_log(
+                    format!("Found {} changed file(s)", changes_to_log.len()),
+                    LogType::Warning,
+                );
             }
-
-            for (file_name, old_content, new_content) in &changes_to_log {
-                self.show_diff(file_name, old_content, new_content);
-            }
-
-            self.add_log(
-                format!("Found {} changed file(s)", changes_to_log.len()),
-                LogType::Warning,
-            );
         }
         Task::none()
     }
 
     fn show_diff(&mut self, file_name: &str, old_content: &str, new_content: &str) {
-        self.add_log(format!("diff [{}]", file_name), LogType::DiffHeader);
+        self.add_log(
+            format!("Opening diff for '{}' in separate window", file_name),
+            LogType::Info,
+        );
+        show_diff_window(old_content.to_string(), new_content.to_string());
+    }
 
-        let old_lines: Vec<&str> = old_content.lines().collect();
-        let new_lines: Vec<&str> = new_content.lines().collect();
-
-        let (removed, added) = simple_diff(&old_lines, &new_lines);
-
-        for line in removed {
-            self.add_log(line, LogType::DiffRemoved);
-        }
-        for line in added {
-            self.add_log(line, LogType::DiffAdded);
+    fn cleanup_local_versions(&self, folder: &Path, file_name: &str) {
+        let (stem, ext) = if let Some(ext_pos) = file_name.rfind('.') {
+            (&file_name[..ext_pos], &file_name[ext_pos..])
+        } else {
+            (file_name, "")
+        };
+        let main_path = folder.join(file_name);
+        let _ = std::fs::remove_file(&main_path);
+        if let Ok(entries) = std::fs::read_dir(folder) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with(stem) && name_str.contains("_v") && name_str.ends_with(ext)
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
         }
     }
 }
 
-fn simple_diff(old_lines: &[&str], new_lines: &[&str]) -> (Vec<String>, Vec<String>) {
-    let mut removed = Vec::new();
-    let mut added = Vec::new();
-
-    let mut old_idx = 0;
-    let mut new_idx = 0;
-
-    while old_idx < old_lines.len() || new_idx < new_lines.len() {
-        if old_idx < old_lines.len() && new_idx < new_lines.len() {
-            if old_lines[old_idx] == new_lines[new_idx] {
-                old_idx += 1;
-                new_idx += 1;
-            } else {
-                removed.push(format!("-{}", old_lines[old_idx]));
-                added.push(format!("+{}", new_lines[new_idx]));
-                old_idx += 1;
-                new_idx += 1;
-            }
-        } else if old_idx < old_lines.len() {
-            removed.push(format!("-{}", old_lines[old_idx]));
-            old_idx += 1;
-        } else {
-            added.push(format!("+{}", new_lines[new_idx]));
-            new_idx += 1;
-        }
+fn detect_file_kind(path: &Path) -> FileKind {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("txt") | Some("rs") | Some("toml") | Some("json") | Some("md") | Some("c")
+        | Some("cpp") | Some("h") | Some("py") | Some("js") | Some("html") => FileKind::Text,
+        Some("docx") => FileKind::Docx,
+        Some("pdf") => FileKind::Pdf,
+        Some("xlsx") | Some("xls") => FileKind::Xlsx,
+        _ => FileKind::Binary,
     }
+}
 
-    (removed, added)
+fn compute_hash(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let n = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 impl State {
@@ -1360,135 +1522,150 @@ impl State {
             column(content_col).spacing(Theme::SPACING_MD)
         };
 
-        let final_content: Element<'_, Message> =
-            if let Some(ref selected_file) = self.selected_file_for_versions {
-                if let Some(versions) = self.version_history.get(selected_file) {
-                    let close_button = button(text("X").size(14))
-                        .on_press(Message::CloseVersionHistory)
-                        .padding([4, 8])
-                        .style(|_, _| button::Style {
-                            background: Some(Theme::ERROR.into()),
-                            text_color: Color::WHITE,
-                            border: iced::border::Border {
-                                radius: Theme::RADIUS_SM.into(),
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        });
-
-                    let versions_list: Vec<Element<'_, Message>> = versions
-                        .iter()
-                        .map(|v| {
-                            let date_str = if v.created_at.len() > 10 {
-                                &v.created_at[..10]
-                            } else {
-                                &v.created_at
-                            };
-                            let author_text = format!("@{}", v.author.login);
-                            let size_str = if v.size < 1024 {
-                                format!("{} B", v.size)
-                            } else if v.size < 1024 * 1024 {
-                                format!("{:.1} KB", v.size as f32 / 1024.0)
-                            } else {
-                                format!("{:.1} MB", v.size as f32 / (1024.0 * 1024.0))
-                            };
-
-                            let download_btn = button(text("⬇").size(12))
-                                .on_press(Message::DownloadFileVersion(
-                                    selected_file.clone(),
-                                    v.version,
-                                ))
-                                .padding([4, 8])
-                                .style(|_, _| button::Style {
-                                    background: Some(Theme::SUCCESS.into()),
-                                    text_color: Color::WHITE,
-                                    border: iced::border::Border {
-                                        radius: Theme::RADIUS_SM.into(),
-                                        ..Default::default()
-                                    },
-                                    ..Default::default()
-                                });
-
-                            container(
-                                row![
-                                    text(format!("v{}", v.version))
-                                        .size(14)
-                                        .width(Length::Fixed(40.0)),
-                                    text(author_text)
-                                        .size(11)
-                                        .width(Length::Fixed(100.0))
-                                        .color(Theme::TEXT_MUTED),
-                                    text(size_str)
-                                        .size(11)
-                                        .width(Length::Fixed(70.0))
-                                        .color(Theme::TEXT_SECONDARY),
-                                    text(date_str)
-                                        .size(11)
-                                        .width(Length::Fixed(90.0))
-                                        .color(Theme::TEXT_MUTED),
-                                    download_btn
-                                ]
-                                .spacing(Theme::SPACING_SM)
-                                .align_y(Alignment::Center),
-                            )
-                            .padding([8, 12])
-                            .style(|_| container::Style {
-                                background: Some(Theme::BACKGROUND_TERTIARY.into()),
-                                border: iced::border::Border {
-                                    radius: Theme::RADIUS_SM.into(),
-                                    ..Default::default()
-                                },
-                                ..Default::default()
-                            })
-                            .into()
-                        })
-                        .collect();
-
-                    let versions_panel = container(
-                        column![
-                            row![
-                                text(format!("Версии: {}", selected_file))
-                                    .size(14)
-                                    .color(Color::WHITE),
-                                close_button
-                            ]
-                            .spacing(Theme::SPACING_SM)
-                            .align_y(Alignment::Center),
-                            scrollable(column(versions_list).spacing(Theme::SPACING_SM))
-                                .height(Length::Fixed(300.0))
-                        ]
-                        .spacing(Theme::SPACING_SM),
-                    )
-                    .padding(Theme::SPACING_MD)
-                    .width(Length::Fill)
-                    .style(|_| container::Style {
-                        background: Some(Theme::CARD_BACKGROUND.into()),
+        let final_content: Element<'_, Message> = if let Some(ref selected_file) =
+            self.selected_file_for_versions
+        {
+            if let Some(versions) = self.version_history.get(selected_file) {
+                let close_button = button(text("X").size(14))
+                    .on_press(Message::CloseVersionHistory)
+                    .padding([4, 8])
+                    .style(|_, _| button::Style {
+                        background: Some(Theme::ERROR.into()),
+                        text_color: Color::WHITE,
                         border: iced::border::Border {
-                            color: Theme::PRIMARY,
-                            width: 2.0,
+                            radius: Theme::RADIUS_SM.into(),
                             ..Default::default()
                         },
                         ..Default::default()
                     });
 
-                    column![
-                        container(content).width(Length::Fill).height(Length::Fill),
-                        versions_panel
-                    ]
-                    .spacing(Theme::SPACING_MD)
-                    .into()
-                } else {
-                    container(content)
-                        .width(Length::Fill)
-                        .height(Length::Fill)
+                let versions_list: Vec<Element<'_, Message>> = versions
+                    .iter()
+                    .map(|v| {
+                        let date_str = if v.created_at.len() > 10 {
+                            &v.created_at[..10]
+                        } else {
+                            &v.created_at
+                        };
+                        let author_text = format!("@{}", v.author.login);
+                        let size_str = if v.size < 1024 {
+                            format!("{} B", v.size)
+                        } else if v.size < 1024 * 1024 {
+                            format!("{:.1} KB", v.size as f32 / 1024.0)
+                        } else {
+                            format!("{:.1} MB", v.size as f32 / (1024.0 * 1024.0))
+                        };
+
+                        let download_btn = button(text("⬇").size(12))
+                            .on_press(Message::DownloadFileVersion(
+                                selected_file.clone(),
+                                v.version,
+                            ))
+                            .padding([4, 8])
+                            .style(|_, _| button::Style {
+                                background: Some(Theme::SUCCESS.into()),
+                                text_color: Color::WHITE,
+                                border: iced::border::Border {
+                                    radius: Theme::RADIUS_SM.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            });
+
+                        let revert_btn = button(text("↺").size(12))
+                            .on_press(Message::RevertToVersion(selected_file.clone(), v.version))
+                            .padding([4, 8])
+                            .style(|_, _| button::Style {
+                                background: Some(Theme::WARNING.into()),
+                                text_color: Color::WHITE,
+                                border: iced::border::Border {
+                                    radius: Theme::RADIUS_SM.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            });
+
+                        container(
+                            row![
+                                text(format!("v{}", v.version))
+                                    .size(14)
+                                    .width(Length::Fixed(40.0)),
+                                text(author_text)
+                                    .size(11)
+                                    .width(Length::Fixed(100.0))
+                                    .color(Theme::TEXT_MUTED),
+                                text(size_str)
+                                    .size(11)
+                                    .width(Length::Fixed(70.0))
+                                    .color(Theme::TEXT_SECONDARY),
+                                text(date_str)
+                                    .size(11)
+                                    .width(Length::Fixed(90.0))
+                                    .color(Theme::TEXT_MUTED),
+                                download_btn,
+                                revert_btn
+                            ]
+                            .spacing(Theme::SPACING_SM)
+                            .align_y(Alignment::Center),
+                        )
+                        .padding([8, 12])
+                        .style(|_| container::Style {
+                            background: Some(Theme::BACKGROUND_TERTIARY.into()),
+                            border: iced::border::Border {
+                                radius: Theme::RADIUS_SM.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        })
                         .into()
-                }
+                    })
+                    .collect();
+
+                let versions_panel = container(
+                    column![
+                        row![
+                            text(format!("Версии: {}", selected_file))
+                                .size(14)
+                                .color(Color::WHITE),
+                            close_button
+                        ]
+                        .spacing(Theme::SPACING_SM)
+                        .align_y(Alignment::Center),
+                        scrollable(column(versions_list).spacing(Theme::SPACING_SM))
+                            .height(Length::Fixed(300.0))
+                    ]
+                    .spacing(Theme::SPACING_SM),
+                )
+                .padding(Theme::SPACING_MD)
+                .width(Length::Fill)
+                .style(|_| container::Style {
+                    background: Some(Theme::CARD_BACKGROUND.into()),
+                    border: iced::border::Border {
+                        color: Theme::PRIMARY,
+                        width: 2.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+
+                column![
+                    container(content).width(Length::Fill).height(Length::Fill),
+                    versions_panel
+                ]
+                .spacing(Theme::SPACING_MD)
+                .into()
             } else {
                 container(content)
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .into()
-            };
+            }
+        } else {
+            container(content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        };
 
         final_content
     }
@@ -1720,6 +1897,146 @@ fn extract_version_from_error(error: &str) -> i32 {
     0
 }
 
+fn extract_text_from_docx(path: &Path) -> Result<String, String> {
+    let doc = rdocx::Document::open(path).map_err(|e| format!("Ошибка открытия DOCX: {}", e))?;
+    let mut text = String::new();
+    for para in doc.paragraphs() {
+        text.push_str(&para.text());
+        text.push('\n');
+    }
+    Ok(text)
+}
+
+fn extract_text_from_pdf(path: &Path) -> Result<String, String> {
+    pdf_extract::extract_text(path).map_err(|e| format!("Ошибка извлечения из PDF: {}", e))
+}
+
+fn extract_text_from_xlsx(path: &Path) -> Result<String, String> {
+    let file = File::open(path).map_err(|e| format!("Ошибка открытия файла: {}", e))?;
+    let mut workbook = Xlsx::new(file).map_err(|e| format!("Ошибка чтения XLSX: {}", e))?;
+
+    let mut full_text = String::new();
+    let sheet_names = workbook.sheet_names().to_vec();
+
+    for sheet_name in sheet_names {
+        full_text.push_str(&format!("=== Лист: {} ===\n", sheet_name));
+
+        let range = workbook
+            .worksheet_range(&sheet_name)
+            .map_err(|e| format!("Ошибка чтения листа '{}': {}", sheet_name, e))?;
+
+        for row in range.rows() {
+            for cell in row {
+                let cell_value = match cell {
+                    Data::String(s) => s.as_str(),
+                    Data::Float(f) => &f.to_string(),
+                    Data::Int(i) => &i.to_string(),
+                    Data::Bool(b) => &b.to_string(),
+                    Data::DateTime(dt) => &dt.to_string(),
+                    Data::Empty => "",
+                    Data::Error(e) => &format!("Error: {}", e),
+                    _ => "",
+                };
+                full_text.push_str(cell_value);
+                full_text.push('\t');
+            }
+            full_text.push('\n');
+        }
+        full_text.push('\n');
+    }
+    Ok(full_text)
+}
+
+fn extract_text_from_file(path: &Path, kind: &FileKind) -> Result<String, String> {
+    match kind {
+        FileKind::Docx => extract_text_from_docx(path),
+        FileKind::Pdf => extract_text_from_pdf(path),
+        FileKind::Xlsx => extract_text_from_xlsx(path),
+        _ => Err("Неподдерживаемый тип".into()),
+    }
+}
+
+fn generate_diff_html(old_content: &str, new_content: &str) -> String {
+    let diff = TextDiff::from_lines(old_content, new_content);
+    let mut unified = diff.unified_diff().context_radius(3).to_string();
+    if !unified.starts_with("--- ") {
+        unified = format!("--- a/file\n+++ b/file\n{}", unified);
+    }
+    let escaped = unified.replace('`', "\\`");
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Diff Viewer</title>
+    <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/diff2html@3.4.45/bundles/css/diff2html.min.css" />
+    <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/diff2html@3.4.45/bundles/js/diff2html-ui.min.js"></script>
+    <style>
+        body {{
+            margin: 0;
+            padding: 20px;
+            background-color: #ffffff;
+            color: #222222;
+        }}
+        /* Оставляем стандартные стили diff2html (они светлые) */
+        .d2h-wrapper {{
+            background-color: #ffffff;
+        }}
+        .d2h-file-header {{
+            background-color: #f7f7f7;
+            color: #222222;
+            border-bottom: 1px solid #e1e4e8;
+        }}
+        .d2h-code-line {{
+            background-color: #ffffff;
+        }}
+        .d2h-code-side-line {{
+            background-color: #ffffff;
+        }}
+        .d2h-info {{
+            background-color: #f8f9fa;
+            color: #586069;
+        }}
+        /* Улучшаем читаемость */
+        .d2h-diff-table {{
+            font-family: 'SF Mono', 'Consolas', 'Liberation Mono', monospace;
+            font-size: 12px;
+        }}
+    </style>
+</head>
+<body>
+    <div id="myDiffElement"></div>
+    <script>
+        const diffString = `{}`;
+        const targetElement = document.getElementById('myDiffElement');
+        const configuration = {{
+            drawFileList: false,
+            fileListToggle: false,
+            fileContentToggle: false,
+            matching: 'lines',
+            outputFormat: 'side-by-side'
+        }};
+        const diff2htmlUi = new Diff2HtmlUI(targetElement, diffString, configuration);
+        diff2htmlUi.draw();
+    </script>
+</body>
+</html>"#,
+        escaped
+    );
+    html
+}
+
+fn show_diff_window(old_content: String, new_content: String) {
+    let html = generate_diff_html(&old_content, &new_content);
+    let temp_file = std::env::temp_dir().join(format!("diff_{}.html", std::process::id()));
+    if let Err(e) = std::fs::write(&temp_file, html) {
+        eprintln!("Failed to write diff HTML: {}", e);
+        return;
+    }
+    if let Err(e) = open::that(&temp_file) {
+        eprintln!("Failed to open diff in browser: {}", e);
+    }
+}
 fn main() -> iced::Result {
     iced::run(State::update, State::view)
 }

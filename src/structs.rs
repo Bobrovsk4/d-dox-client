@@ -74,6 +74,8 @@ pub struct LogEntry {
 pub struct TrackedFile {
     pub _path: PathBuf,
     pub content: String,
+    pub extracted_text: Option<String>,
+    pub content_hash: Option<String>,
     pub last_modified: u64,
     pub version: i32,
     pub file_id: i32,
@@ -211,11 +213,23 @@ pub enum Message {
     Logout,
     ResolveConflictKeepLocal(String),
     ResolveConflictKeepServer(String),
-    FetchFileVersions(String), // file_name
+    FetchFileVersions(String),
     FileVersionsReceived(String, Result<Vec<FileVersionInfo>, String>),
-    DownloadFileVersion(String, i32), // file_name, version
+    DownloadFileVersion(String, i32),
     FileVersionDownloaded(Result<std::path::PathBuf, String>),
     CloseVersionHistory,
     DeleteFile(String),
     FileDeleted(Result<String, String>),
+    RevertToVersion(String, i32),
+    RevertResult(Result<(String, i32), String>),
+    ShowDiff(String, String),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum FileKind {
+    Text,
+    Docx,
+    Pdf,
+    Xlsx,
+    Binary,
 }

@@ -15,5 +15,11 @@ serde_json = "1.0"
 rfd = "0.17.2"
 tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros", "rt"] }
 open = "5"
-jsonwebtoken = "9"
-chrono = "0.4"
+jsonwebtoken = { version = "9", default-features = false, features = [
+  "use_pem",
+] }
+sha2 = "0.10"
+similar = "3.1.0"
+rdocx = "0.1.2"
+pdf-extract = "0.10.0"
+calamine = "0.34.0"
